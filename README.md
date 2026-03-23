@@ -18,7 +18,7 @@ It's built for scientists, analysts, and curious people who want a powerful AI w
 - **Access 250+ scientific databases and 500k+ Python packages** — Kady's experts come pre-loaded with specialized scientific skills from [K-Dense](https://github.com/K-Dense-AI), covering everything from genomics to materials science.
 - **Choose your AI model** — Pick from 40+ models (OpenAI, Anthropic, Google, xAI, Qwen, and more) through a simple dropdown in the app. You're not stuck with one.
 
-> **Note:** The model you select in the dropdown only applies to Kady (the main agent). Expert execution and coding tasks use the Gemini CLI, which always runs through a Gemini model on OpenRouter regardless of your dropdown selection.
+> **Note:** The model you select in the dropdown only applies to Kady (the main agent). Expert execution and coding tasks use the Gemini CLI, which always runs through a Gemini model on [OpenRouter](https://openrouter.ai/) regardless of your dropdown selection.
 - **Run heavy computations remotely** — Optionally connect [Modal](https://modal.com/) to run demanding workloads on powerful cloud hardware instead of your laptop.
 
 ## What you'll need before starting
@@ -89,7 +89,7 @@ The app runs three services on your computer:
 |---------|-------------|
 | **Frontend** (port 3000) | The web interface you interact with — chat, file browser, and file preview side by side |
 | **Backend** (port 8000) | The brain — runs Kady and coordinates expert tasks |
-| **LiteLLM proxy** (port 4000) | A translator that routes your AI requests to whichever model you've chosen via OpenRouter |
+| **LiteLLM proxy** (port 4000) | A translator that routes your AI requests to whichever model you've chosen via [OpenRouter](https://openrouter.ai/) |
 
 When you send a message, Kady reads it, decides whether to answer directly or delegate to an expert, uses any needed tools (web search, file operations, scientific databases), and streams the response back to you.
 
