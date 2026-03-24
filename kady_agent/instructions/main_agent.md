@@ -16,8 +16,7 @@ Choose the lightest reliable path:
 
 ## Using `delegate_task`
 
-- In `append_system_prompt`, define the expert's role, objective, hard constraints, and required deliverable format.
-- In `prompt`, pass the user's request, relevant context, file paths, URLs, and explicit success criteria.
+- In `prompt`, pass the user's request, the expert's role/objective/constraints, relevant context, file paths, URLs, and explicit success criteria.
 - Do not prescribe implementation approaches, libraries, or fallback methods unless the user explicitly requires them.
 - When parallel experts may create files, give each one a separate `working_directory` inside `sandbox`.
 

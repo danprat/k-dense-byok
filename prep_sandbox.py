@@ -1,9 +1,11 @@
 import os
+import shutil
 import subprocess
 
 from kady_agent.utils import download_scientific_skills
 
 SANDBOX_DIR = "sandbox"
+GEMINI_CLI_MD = os.path.join("kady_agent", "instructions", "gemini_cli.md")
 SANDBOX_VENV = os.path.join(SANDBOX_DIR, ".venv")
 SANDBOX_PYPROJECT = os.path.join(SANDBOX_DIR, "pyproject.toml")
 
@@ -29,6 +31,8 @@ dependencies = [
 """
 
 os.makedirs(SANDBOX_DIR, exist_ok=True)
+
+shutil.copy2(GEMINI_CLI_MD, os.path.join(SANDBOX_DIR, "GEMINI.md"))
 
 if not os.path.isfile(SANDBOX_PYPROJECT):
     print("Seeding sandbox pyproject.toml...")
