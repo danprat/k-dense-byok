@@ -57,7 +57,10 @@ import {
   ScrollTextIcon,
   MessageSquareTextIcon,
   WorkflowIcon,
+  SunIcon,
+  MoonIcon,
 } from "lucide-react";
+import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Image from "next/image";
@@ -562,11 +565,15 @@ export default function ChatPage() {
   const config = useConfig();
   const { updateAvailable } = useUpdateCheck();
   const { skills: allSkills } = useSkills();
+  const { resolvedTheme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(true);
   const [provenanceOpen, setProvenanceOpen] = useState(false);
   const turnMetaRef = useRef<Map<string, TurnMeta>>(new Map());
   const prevMessageCount = useRef(0);
+
+  useEffect(() => setMounted(true), []);
 
   // Resizable panel widths (px)
   const [treeWidth, setTreeWidth] = useState(280);
@@ -769,6 +776,15 @@ export default function ChatPage() {
               <PanelLeftIcon className="size-4" />
             )}
           </button>
+          {mounted && (
+            <button
+              onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
+              className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              title={resolvedTheme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {resolvedTheme === "dark" ? <SunIcon className="size-4" /> : <MoonIcon className="size-4" />}
+            </button>
+          )}
         </div>
       </header>
 
