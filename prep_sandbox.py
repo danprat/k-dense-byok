@@ -13,7 +13,7 @@ SANDBOX_PYPROJECT = os.path.join(SANDBOX_DIR, "pyproject.toml")
 _PYPROJECT_TEMPLATE = """\
 [project]
 name = "kady-sandbox"
-version = "0.1.1"
+version = "0.1.2"
 description = "Packages installed by Kady expert agents"
 requires-python = ">=3.13"
 dependencies = [
@@ -28,6 +28,7 @@ dependencies = [
     "pyopenms>=3.5.0",
     "scipy>=1.17.1",
     "transformers>=4.57.6",
+    "parallel-web>=0.4.2",
 ]
 """
 
