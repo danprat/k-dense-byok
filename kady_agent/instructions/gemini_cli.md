@@ -25,6 +25,7 @@ You have access to **skills** — curated playbooks containing tested scripts, A
 - Once a skill is active, its prescribed method (scripts, commands, API calls) is the **only acceptable approach**. Do not write your own alternative implementation.
 - If a skill's script fails, **debug and fix the failure** — do not abandon the skill and rewrite from scratch.
 - If several skills apply, use the most specific one first, then layer others as needed.
+- **Transitive activation:** Skills sometimes reference other skills by name (e.g. "use the generate-image skill for creating a schematic" or "activate scientific-visualization for figures"). When you encounter such a reference inside an activated skill, you **MUST** call `activate_skill` for the referenced skill immediately before continuing. Treat skill-to-skill references the same way you treat explicitly named skills in the prompt — they are mandatory, not suggestions.
 
 ### Step 2 — Verify before every tool call
 

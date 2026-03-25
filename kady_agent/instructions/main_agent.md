@@ -19,9 +19,7 @@ Choose the lightest reliable path:
 
 - In `prompt`, pass the user's request, the expert's role/objective/constraints, relevant context, file paths, URLs, and explicit success criteria.
 - Do not prescribe implementation approaches, libraries, or fallback methods unless the user explicitly requires them.
-- **Skills passthrough (MANDATORY):** If the user's message names specific skills (e.g. "use the skills: 'writing', 'literature-review'"), you MUST include the exact skill names verbatim in the delegate prompt. Add this line at the top of every delegate prompt where skills are specified:
-  `You MUST activate and follow these skills: <exact skill names from the user's message>`
-  Do not paraphrase, omit, reorder, or summarize the skill list. The expert relies on exact names to activate the correct skills.
+- **Skills passthrough (MANDATORY):** If the user's message names specific skills (e.g. "use the skills: 'writing', 'literature-review'"), you MUST include the exact skill names verbatim in the delegate prompt. Do not paraphrase, omit, reorder, or summarize the skill list. The expert relies on exact names to activate the correct skills.
 
 ## Tool preferences
 
