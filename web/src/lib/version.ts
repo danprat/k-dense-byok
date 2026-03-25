@@ -6,10 +6,15 @@ export const APP_VERSION = "0.2.4";
 
 const GITHUB_REPO = "K-Dense-AI/k-dense-byok";
 const CACHE_KEY = "kdense-update-check";
+const CACHE_TTL_MS = 60 * 60 * 1000; // re-check at most once per hour
 
 interface UpdateCheckResult {
   updateAvailable: boolean;
   latestVersion: string | null;
+}
+
+interface CachedCheck extends UpdateCheckResult {
+  ts: number;
 }
 
 function compareSemver(current: string, latest: string): boolean {
@@ -28,14 +33,17 @@ export function useUpdateCheck(): UpdateCheckResult {
   });
 
   useEffect(() => {
-    const cached = sessionStorage.getItem(CACHE_KEY);
-    if (cached) {
-      try {
-        setResult(JSON.parse(cached));
-        return;
-      } catch {
-        sessionStorage.removeItem(CACHE_KEY);
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (raw) {
+        const cached: CachedCheck = JSON.parse(raw);
+        if (Date.now() - cached.ts < CACHE_TTL_MS) {
+          setResult({ updateAvailable: cached.updateAvailable, latestVersion: cached.latestVersion });
+          return;
+        }
       }
+    } catch {
+      localStorage.removeItem(CACHE_KEY);
     }
 
     fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`)
@@ -48,9 +56,9 @@ export function useUpdateCheck(): UpdateCheckResult {
         const latestVersion = tag.replace(/^v/, "");
         const updateAvailable =
           latestVersion.length > 0 && compareSemver(APP_VERSION, latestVersion);
-        const value = { updateAvailable, latestVersion };
-        sessionStorage.setItem(CACHE_KEY, JSON.stringify(value));
-        setResult(value);
+        const value: CachedCheck = { updateAvailable, latestVersion, ts: Date.now() };
+        localStorage.setItem(CACHE_KEY, JSON.stringify(value));
+        setResult({ updateAvailable, latestVersion });
       })
       .catch(() => {
         // Network error or rate limit — silently ignore
