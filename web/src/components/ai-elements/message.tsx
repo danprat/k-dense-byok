@@ -17,7 +17,8 @@ import {
 import { cn } from "@/lib/utils";
 import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
-import { math } from "@streamdown/math";
+import { createMathPlugin } from "@streamdown/math";
+import "katex/dist/katex.min.css";
 import { mermaid } from "@streamdown/mermaid";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
 import {
@@ -324,6 +325,7 @@ export const MessageBranchPage = ({
 
 export type MessageResponseProps = ComponentProps<typeof Streamdown>;
 
+const math = createMathPlugin({ singleDollarTextMath: true });
 const streamdownPlugins = { cjk, code, math, mermaid };
 
 const linkSafetyOff = { enabled: false } as const;
