@@ -63,11 +63,29 @@ import {
   SettingsIcon,
   SunIcon,
   MoonIcon,
+  ListOrderedIcon,
+  DatabaseIcon,
+  CpuIcon,
+  SparklesIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Image from "next/image";
+
+const MAX_QUEUE = 5;
+
+interface QueuedMessage {
+  id: string;
+  rawText: string;
+  text: string;
+  model: { id: string; label: string };
+  databases: Database[];
+  compute: ModalInstance | null;
+  skills: Skill[];
+  files: string[];
+  timestamp: number;
+}
 
 // Thin vertical drag handle between two panels
 function ResizeHandle({ onMouseDown }: { onMouseDown: (e: React.MouseEvent) => void }) {
@@ -366,6 +384,86 @@ function AssistantActivity({
   );
 }
 
+function MessageQueueDisplay({
+  queue,
+  onRemove,
+}: {
+  queue: QueuedMessage[];
+  onRemove: (id: string) => void;
+}) {
+  if (queue.length === 0) return null;
+
+  return (
+    <div className="absolute bottom-full left-0 right-0 z-10 mb-2">
+      <div className="overflow-hidden rounded-xl border bg-background shadow-lg">
+        <div className="flex items-center gap-2 border-b px-3 py-1.5">
+          <ListOrderedIcon className="size-3.5 text-muted-foreground" />
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Queued
+          </span>
+          <span className="ml-auto text-[10px] tabular-nums text-muted-foreground">
+            {queue.length}/{MAX_QUEUE}
+          </span>
+        </div>
+        <div className="max-h-52 overflow-y-auto py-1">
+          {queue.map((item, i) => (
+            <div
+              key={item.id}
+              className="group flex items-center gap-2.5 px-3 py-2 text-xs transition-colors hover:bg-muted/50"
+            >
+              <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-[10px] font-semibold tabular-nums text-muted-foreground">
+                {i + 1}
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-foreground">
+                  {item.rawText || item.text.split("\n")[0]}
+                </div>
+                <div className="mt-0.5 flex flex-wrap gap-1">
+                  <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {item.model.label}
+                  </span>
+                  {item.files.length > 0 && (
+                    <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      <PaperclipIcon className="size-2.5" />
+                      {item.files.length}
+                    </span>
+                  )}
+                  {item.databases.length > 0 && (
+                    <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      <DatabaseIcon className="size-2.5" />
+                      {item.databases.length}
+                    </span>
+                  )}
+                  {item.compute && (
+                    <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      <CpuIcon className="size-2.5" />
+                      {item.compute.label}
+                    </span>
+                  )}
+                  {item.skills.length > 0 && (
+                    <span className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      <SparklesIcon className="size-2.5" />
+                      {item.skills.length}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => onRemove(item.id)}
+                className="shrink-0 rounded p-1 text-muted-foreground/40 opacity-0 transition-all group-hover:opacity-100 hover:bg-destructive/10 hover:text-destructive"
+                aria-label={`Remove queued message ${i + 1}`}
+              >
+                <XIcon className="size-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Full prompt input: @ mention overlay + drag-drop zone.
  * Must be rendered inside <PromptInputProvider>.
@@ -391,6 +489,8 @@ function ChatInput({
   allSkills,
   selectedSkills,
   onSkillsChange,
+  queuedMessages,
+  onRemoveFromQueue,
 }: {
   allFiles: string[];
   attachedFiles: string[];
@@ -412,6 +512,8 @@ function ChatInput({
   allSkills: Skill[];
   selectedSkills: Skill[];
   onSkillsChange: (skills: Skill[]) => void;
+  queuedMessages: QueuedMessage[];
+  onRemoveFromQueue: (id: string) => void;
 }) {
   const controller = usePromptInputController();
 
@@ -580,6 +682,10 @@ function ChatInput({
           </div>
         )}
 
+        {!isMentionOpen && (
+          <MessageQueueDisplay queue={queuedMessages} onRemove={onRemoveFromQueue} />
+        )}
+
         <PromptInput onSubmit={handleSubmit} className="rounded-xl border shadow-sm">
           {/* Attached file chips */}
           {attachedFiles.length > 0 && (
@@ -590,7 +696,13 @@ function ChatInput({
             </div>
           )}
           <PromptInputTextarea
-            placeholder="Ask Kady anything… (@ for files, drag to attach)"
+            placeholder={
+              queuedMessages.length >= MAX_QUEUE
+                ? `Queue full (${MAX_QUEUE}/${MAX_QUEUE})`
+                : isStreaming && queuedMessages.length > 0
+                  ? `Ask Kady anything… (${queuedMessages.length}/${MAX_QUEUE} queued)`
+                  : "Ask Kady anything… (@ for files, drag to attach)"
+            }
             onChange={handleChange}
             onKeyDown={handleKeyDown}
           />
@@ -723,6 +835,14 @@ export default function ChatPage() {
   // Selected expert skills
   const [selectedSkills, setSelectedSkills] = useState<Skill[]>([]);
 
+  // Message queue for prompts sent while the agent is busy
+  const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([]);
+  const queueIdCounter = useRef(0);
+
+  const removeFromQueue = useCallback((id: string) => {
+    setMessageQueue((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
   // Chat vs Workflows tab
   const [activeTab, setActiveTab] = useState<"chat" | "workflows">("chat");
 
@@ -754,6 +874,25 @@ export default function ChatPage() {
 
   const handleSubmit = useCallback(
     async ({ text }: { text: string }) => {
+      if (isStreaming) {
+        if (messageQueue.length >= MAX_QUEUE) return;
+        const rawText = text.split("\n")[0];
+        setMessageQueue((prev) => [
+          ...prev,
+          {
+            id: String(++queueIdCounter.current),
+            rawText,
+            text,
+            model: { id: selectedModel.id, label: selectedModel.label },
+            databases: [...selectedDbs],
+            compute: selectedCompute,
+            skills: [...selectedSkills],
+            files: [...attachedFiles],
+            timestamp: Date.now(),
+          },
+        ]);
+        return;
+      }
       const msgId = await send(text, selectedModel.id);
       if (msgId) {
         turnMetaRef.current.set(msgId, {
@@ -766,8 +905,27 @@ export default function ChatPage() {
         });
       }
     },
-    [send, selectedModel, selectedDbs, selectedCompute, selectedSkills, attachedFiles]
+    [send, selectedModel, selectedDbs, selectedCompute, selectedSkills, attachedFiles, isStreaming, messageQueue.length]
   );
+
+  // Auto-send the next queued message when the agent becomes ready
+  useEffect(() => {
+    if (status !== "ready" || messageQueue.length === 0) return;
+    const [next, ...rest] = messageQueue;
+    setMessageQueue(rest);
+    send(next.text, next.model.id).then((msgId) => {
+      if (msgId) {
+        turnMetaRef.current.set(msgId, {
+          model: next.model.label,
+          databases: next.databases.map((db) => db.name),
+          compute: next.compute?.label ?? null,
+          skills: next.skills.map((s) => s.name),
+          filesAttached: [...next.files],
+          timestamp: next.timestamp,
+        });
+      }
+    });
+  }, [status, messageQueue, send]);
 
   const handleOrganize = useCallback(() => {
     send("Organize all the files in the sandbox directory", selectedModel.id);
@@ -1027,6 +1185,8 @@ export default function ChatPage() {
                     allSkills={allSkills}
                     selectedSkills={selectedSkills}
                     onSkillsChange={setSelectedSkills}
+                    queuedMessages={messageQueue}
+                    onRemoveFromQueue={removeFromQueue}
                   />
                 </PromptInputProvider>
               </div>
