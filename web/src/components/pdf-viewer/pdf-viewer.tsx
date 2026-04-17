@@ -1,0 +1,854 @@
+"use client";
+
+/**
+ * Custom PDF viewer built on pdfjs-dist with a per-page annotation overlay.
+ *
+ * Architecture:
+ *   - Dynamically imports pdfjs-dist on the client (it doesn't SSR well).
+ *   - Renders each page as a <canvas> with pdfjs's text layer on top,
+ *     then stacks an absolute-positioned <AnnotationLayer> per page for
+ *     highlights and note pins.
+ *   - Annotations are stored in PDF user-space points (y-up, page-local)
+ *     and converted to CSS pixels via the page viewport transform, so
+ *     they stay aligned when zoom changes.
+ *   - State is persisted to <file>.pdf.annotations.json via the endpoints
+ *     in pdf-annotations.ts, and polled for external writes (e.g. the
+ *     expert-side MCP dropping its own annotations mid-delegation).
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import { rawFileUrl } from "@/lib/use-sandbox";
+import {
+  type Annotation,
+  type AnnotationsDoc,
+  type Author,
+  type HighlightAnnotation,
+  type NoteAnnotation,
+  type Rect,
+  EMPTY_DOC,
+  USER_AUTHOR,
+  USER_COLOR,
+  colorForAuthor,
+  fetchAnnotations,
+  newAnnotationId,
+  saveAnnotations,
+  subscribeAnnotations,
+} from "@/lib/pdf-annotations";
+import { cn } from "@/lib/utils";
+
+import { AnnotationLayer } from "./annotation-layer";
+import { AnnotationSidebar } from "./annotation-sidebar";
+import { NotePopover } from "./note-popover";
+
+type PdfjsModule = typeof import("pdfjs-dist");
+type PdfDoc = import("pdfjs-dist").PDFDocumentProxy;
+type PdfPage = import("pdfjs-dist").PDFPageProxy;
+
+let pdfjsPromise: Promise<PdfjsModule> | null = null;
+
+function loadPdfjs(): Promise<PdfjsModule> {
+  if (pdfjsPromise) return pdfjsPromise;
+  pdfjsPromise = (async () => {
+    const pdfjs = await import("pdfjs-dist");
+    const worker = await import("pdfjs-dist/build/pdf.worker.min.mjs?url").catch(
+      async () => {
+        // Fallback for bundlers that don't support ?url.
+        const mod = await import("pdfjs-dist/build/pdf.worker.min.mjs");
+        return { default: mod };
+      },
+    );
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      (worker as { default: string }).default;
+    return pdfjs;
+  })();
+  return pdfjsPromise;
+}
+
+// Rendering scale — multiplied by zoom. 1.5 gives us a crisp canvas at
+// 100% zoom; we set devicePixelRatio separately on the canvas.
+const BASE_SCALE = 1.5;
+
+export interface PdfViewerProps {
+  path: string;
+  className?: string;
+}
+
+export function PdfViewer({ path, className }: PdfViewerProps) {
+  const [pdfjs, setPdfjs] = useState<PdfjsModule | null>(null);
+  const [doc, setDoc] = useState<PdfDoc | null>(null);
+  const [numPages, setNumPages] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(1);
+
+  const [annotations, setAnnotations] =
+    useState<AnnotationsDoc>(EMPTY_DOC);
+  const [lastModified, setLastModified] = useState<string | null>(null);
+  const annotationsRef = useRef<AnnotationsDoc>(EMPTY_DOC);
+  const lastModifiedRef = useRef<string | null>(null);
+  useEffect(() => {
+    annotationsRef.current = annotations;
+  }, [annotations]);
+  useEffect(() => {
+    lastModifiedRef.current = lastModified;
+  }, [lastModified]);
+
+  const [mode, setMode] = useState<"none" | "highlight" | "note">("none");
+  const [showExpert, setShowExpert] = useState(true);
+  const [activeAnnotationId, setActiveAnnotationId] =
+    useState<string | null>(null);
+  const [pendingNote, setPendingNote] = useState<{
+    page: number;
+    anchor: { x: number; y: number };
+    screen: { x: number; y: number };
+  } | null>(null);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+
+  // --------------------------------------------------------------------
+  // Load pdfjs + document
+  // --------------------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+    loadPdfjs()
+      .then((mod) => {
+        if (!cancelled) setPdfjs(mod);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e?.message ?? "Failed to load PDF engine");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pdfjs) return;
+    let cancelled = false;
+    const url = rawFileUrl(path);
+    const task = pdfjs.getDocument({ url, withCredentials: true });
+    // Reset happens in the promise callbacks so we don't trigger a
+    // cascading render just for loading.
+    Promise.resolve().then(() => {
+      if (cancelled) return;
+      setError(null);
+      setDoc(null);
+      setNumPages(0);
+    });
+    task.promise.then(
+      (loaded) => {
+        if (cancelled) {
+          loaded.destroy();
+          return;
+        }
+        setDoc(loaded);
+        setNumPages(loaded.numPages);
+      },
+      (e) => {
+        if (!cancelled) setError(e?.message ?? "Failed to load PDF");
+      },
+    );
+    return () => {
+      cancelled = true;
+      task.destroy();
+    };
+  }, [pdfjs, path]);
+
+  // --------------------------------------------------------------------
+  // Annotations fetch + polling
+  // --------------------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchAnnotations(path).then((res) => {
+      if (cancelled) return;
+      setAnnotations(res.doc);
+      setLastModified(res.lastModified);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+
+  useEffect(() => {
+    const unsub = subscribeAnnotations(
+      path,
+      lastModifiedRef.current,
+      ({ doc: newDoc, lastModified: newMtime }) => {
+        setAnnotations(newDoc);
+        setLastModified(newMtime);
+      },
+    );
+    return unsub;
+  }, [path]);
+
+  // --------------------------------------------------------------------
+  // Persistence (debounced per keystroke is overkill — we save on every
+  // annotation mutation and rely on If-Unmodified-Since to avoid clobber)
+  // --------------------------------------------------------------------
+
+  const persist = useCallback(
+    async (next: AnnotationsDoc) => {
+      const res = await saveAnnotations(
+        path,
+        next,
+        lastModifiedRef.current,
+      );
+      if (res.conflict) {
+        const fresh = await fetchAnnotations(path);
+        // Merge: start from disk, then re-apply our local changes that
+        // aren't present there (by id). Disk wins on id collisions.
+        const byId = new Map<string, Annotation>();
+        for (const a of fresh.doc.annotations) byId.set(a.id, a);
+        for (const a of next.annotations) {
+          if (!byId.has(a.id)) byId.set(a.id, a);
+        }
+        const merged: AnnotationsDoc = {
+          version: 1,
+          annotations: Array.from(byId.values()),
+        };
+        setAnnotations(merged);
+        setLastModified(fresh.lastModified);
+        const retry = await saveAnnotations(
+          path,
+          merged,
+          fresh.lastModified,
+        );
+        if (retry.ok) setLastModified(retry.lastModified);
+        return;
+      }
+      if (res.ok) setLastModified(res.lastModified);
+    },
+    [path],
+  );
+
+  const mutate = useCallback(
+    (updater: (prev: AnnotationsDoc) => AnnotationsDoc) => {
+      setAnnotations((prev) => {
+        const next = updater(prev);
+        void persist(next);
+        return next;
+      });
+    },
+    [persist],
+  );
+
+  const addAnnotation = useCallback(
+    (ann: Annotation) => {
+      mutate((prev) => ({
+        version: 1,
+        annotations: [...prev.annotations, ann],
+      }));
+    },
+    [mutate],
+  );
+
+  const removeAnnotation = useCallback(
+    (id: string) => {
+      mutate((prev) => ({
+        version: 1,
+        annotations: prev.annotations.filter((a) => a.id !== id),
+      }));
+    },
+    [mutate],
+  );
+
+  const updateAnnotation = useCallback(
+    (id: string, patch: Partial<Annotation>) => {
+      mutate((prev) => ({
+        version: 1,
+        annotations: prev.annotations.map((a) =>
+          a.id === id ? ({ ...a, ...patch } as Annotation) : a,
+        ),
+      }));
+    },
+    [mutate],
+  );
+
+  // --------------------------------------------------------------------
+  // Highlight from current text selection
+  // --------------------------------------------------------------------
+
+  const handleHighlightSelection = useCallback(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+
+    // Find the page each selection rect belongs to, using the
+    // data-page attribute on each page wrapper.
+    const pageEls = Array.from(
+      containerRef.current?.querySelectorAll<HTMLElement>(
+        "[data-pdf-page]",
+      ) ?? [],
+    );
+    if (!pageEls.length) return;
+
+    // Group rects by page.
+    const byPage = new Map<
+      HTMLElement,
+      { rects: DOMRect[]; page: number }
+    >();
+    for (const rect of Array.from(range.getClientRects())) {
+      if (rect.width < 1 || rect.height < 1) continue;
+      const midX = rect.left + rect.width / 2;
+      const midY = rect.top + rect.height / 2;
+      for (const el of pageEls) {
+        const box = el.getBoundingClientRect();
+        if (
+          midX >= box.left &&
+          midX <= box.right &&
+          midY >= box.top &&
+          midY <= box.bottom
+        ) {
+          const page = Number(el.dataset.pdfPage);
+          if (!byPage.has(el))
+            byPage.set(el, { rects: [], page });
+          byPage.get(el)!.rects.push(rect);
+          break;
+        }
+      }
+    }
+
+    const text = sel.toString().trim();
+    const createdAt = new Date().toISOString();
+
+    for (const [el, { rects, page }] of byPage) {
+      const pageBox = el.getBoundingClientRect();
+      const viewport = readViewport(el);
+      if (!viewport) continue;
+      const pdfRects: Rect[] = rects.map((r) => {
+        // CSS-space rect relative to page box, then to PDF-space.
+        const x1 = r.left - pageBox.left;
+        const y1 = r.top - pageBox.top;
+        const x2 = r.right - pageBox.left;
+        const y2 = r.bottom - pageBox.top;
+        const [px1, py1] = viewport.convertToPdfPoint(x1, y1);
+        const [px2, py2] = viewport.convertToPdfPoint(x2, y2);
+        const x = Math.min(px1, px2);
+        const y = Math.min(py1, py2);
+        const w = Math.abs(px2 - px1);
+        const h = Math.abs(py2 - py1);
+        return { x, y, w, h };
+      });
+      if (!pdfRects.length) continue;
+      const ann: HighlightAnnotation = {
+        id: newAnnotationId(),
+        type: "highlight",
+        page,
+        rects: pdfRects,
+        text,
+        color: USER_COLOR,
+        author: USER_AUTHOR,
+        createdAt,
+      };
+      addAnnotation(ann);
+    }
+
+    sel.removeAllRanges();
+    setMode("none");
+  }, [addAnnotation]);
+
+  // --------------------------------------------------------------------
+  // Drop-a-note interaction
+  // --------------------------------------------------------------------
+
+  const handlePageClick = useCallback(
+    (ev: React.MouseEvent<HTMLDivElement>, page: number) => {
+      if (mode !== "note") return;
+      const el = ev.currentTarget;
+      const box = el.getBoundingClientRect();
+      const cssX = ev.clientX - box.left;
+      const cssY = ev.clientY - box.top;
+      const viewport = readViewport(el);
+      if (!viewport) return;
+      const [x, y] = viewport.convertToPdfPoint(cssX, cssY);
+      setPendingNote({
+        page,
+        anchor: { x, y },
+        screen: { x: ev.clientX, y: ev.clientY },
+      });
+      setMode("none");
+    },
+    [mode],
+  );
+
+  // --------------------------------------------------------------------
+  // Filtered view for the layers + sidebar
+  // --------------------------------------------------------------------
+
+  const visibleAnnotations = useMemo(
+    () =>
+      annotations.annotations.filter(
+        (a) => showExpert || a.author.kind !== "expert",
+      ),
+    [annotations, showExpert],
+  );
+
+  const annotationsByPage = useMemo(() => {
+    const map = new Map<number, Annotation[]>();
+    for (const a of visibleAnnotations) {
+      if (!map.has(a.page)) map.set(a.page, []);
+      map.get(a.page)!.push(a);
+    }
+    return map;
+  }, [visibleAnnotations]);
+
+  const jumpToAnnotation = useCallback((ann: Annotation) => {
+    const el = containerRef.current?.querySelector<HTMLElement>(
+      `[data-pdf-page="${ann.page}"]`,
+    );
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setActiveAnnotationId(ann.id);
+    setTimeout(() => setActiveAnnotationId(null), 1500);
+  }, []);
+
+  // --------------------------------------------------------------------
+  // Track current page for the toolbar
+  // --------------------------------------------------------------------
+
+  useEffect(() => {
+    const c = containerRef.current;
+    if (!c) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort(
+            (a, b) =>
+              (b.intersectionRatio ?? 0) - (a.intersectionRatio ?? 0),
+          );
+        if (visible.length) {
+          const page = Number(
+            (visible[0].target as HTMLElement).dataset.pdfPage,
+          );
+          if (page) setCurrentPage(page);
+        }
+      },
+      { root: c, threshold: [0.25, 0.5, 0.75] },
+    );
+    const pages = c.querySelectorAll("[data-pdf-page]");
+    pages.forEach((p) => observer.observe(p));
+    return () => observer.disconnect();
+  }, [numPages]);
+
+  // --------------------------------------------------------------------
+  // Render
+  // --------------------------------------------------------------------
+
+  if (error) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-destructive">
+        {error}
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("flex h-full flex-col", className)}>
+      <Toolbar
+        currentPage={currentPage}
+        numPages={numPages}
+        zoom={zoom}
+        setZoom={setZoom}
+        mode={mode}
+        setMode={setMode}
+        onCommitHighlight={handleHighlightSelection}
+        showExpert={showExpert}
+        setShowExpert={setShowExpert}
+        onJumpPage={(p) => {
+          const el = containerRef.current?.querySelector<HTMLElement>(
+            `[data-pdf-page="${p}"]`,
+          );
+          if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+        }}
+      />
+
+      <div className="flex flex-1 min-h-0">
+        <div
+          ref={containerRef}
+          className={cn(
+            "flex-1 overflow-auto bg-muted/30",
+            mode === "note" && "cursor-crosshair",
+          )}
+        >
+          <div className="mx-auto flex flex-col items-center gap-3 py-3">
+            {doc &&
+              Array.from({ length: numPages }, (_, i) => i + 1).map(
+                (pageNumber) => (
+                  <PageView
+                    key={pageNumber}
+                    doc={doc}
+                    pageNumber={pageNumber}
+                    zoom={zoom}
+                    annotations={
+                      annotationsByPage.get(pageNumber) ?? []
+                    }
+                    activeAnnotationId={activeAnnotationId}
+                    onRemove={removeAnnotation}
+                    onUpdate={updateAnnotation}
+                    onClickPage={(e) => handlePageClick(e, pageNumber)}
+                  />
+                ),
+              )}
+            {!doc && (
+              <div className="py-10 text-sm text-muted-foreground">
+                Loading PDF…
+              </div>
+            )}
+          </div>
+        </div>
+
+        <AnnotationSidebar
+          annotations={visibleAnnotations}
+          onJump={jumpToAnnotation}
+          onRemove={removeAnnotation}
+        />
+      </div>
+
+      {pendingNote && (
+        <NotePopover
+          screen={pendingNote.screen}
+          initialBody=""
+          author={USER_AUTHOR}
+          onCancel={() => setPendingNote(null)}
+          onSave={(body) => {
+            const ann: NoteAnnotation = {
+              id: newAnnotationId(),
+              type: "note",
+              page: pendingNote.page,
+              anchor: pendingNote.anchor,
+              body,
+              color: USER_COLOR,
+              author: USER_AUTHOR,
+              createdAt: new Date().toISOString(),
+            };
+            addAnnotation(ann);
+            setPendingNote(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar
+// ---------------------------------------------------------------------------
+
+function Toolbar({
+  currentPage,
+  numPages,
+  zoom,
+  setZoom,
+  mode,
+  setMode,
+  onCommitHighlight,
+  showExpert,
+  setShowExpert,
+  onJumpPage,
+}: {
+  currentPage: number;
+  numPages: number;
+  zoom: number;
+  setZoom: (z: number) => void;
+  mode: "none" | "highlight" | "note";
+  setMode: (m: "none" | "highlight" | "note") => void;
+  onCommitHighlight: () => void;
+  showExpert: boolean;
+  setShowExpert: (v: boolean) => void;
+  onJumpPage: (p: number) => void;
+}) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b bg-background/60 px-2 py-1 text-xs">
+      <button
+        className="rounded px-2 py-1 hover:bg-muted"
+        title="Zoom out"
+        onClick={() => setZoom(Math.max(0.4, +(zoom - 0.1).toFixed(2)))}
+      >
+        −
+      </button>
+      <span className="w-12 text-center tabular-nums">
+        {Math.round(zoom * 100)}%
+      </span>
+      <button
+        className="rounded px-2 py-1 hover:bg-muted"
+        title="Zoom in"
+        onClick={() => setZoom(Math.min(4, +(zoom + 0.1).toFixed(2)))}
+      >
+        +
+      </button>
+      <button
+        className="rounded px-2 py-1 hover:bg-muted"
+        onClick={() => setZoom(1)}
+        title="Fit 100%"
+      >
+        100%
+      </button>
+
+      <div className="mx-2 h-4 w-px bg-border" />
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          const v = Number(
+            (e.currentTarget.elements.namedItem("p") as HTMLInputElement)
+              .value,
+          );
+          if (v >= 1 && v <= numPages) onJumpPage(v);
+        }}
+        className="flex items-center gap-1"
+      >
+        Page
+        <input
+          name="p"
+          defaultValue={currentPage}
+          key={currentPage}
+          className="w-10 rounded border bg-transparent px-1 py-0.5 text-center tabular-nums"
+        />
+        / <span className="tabular-nums">{numPages}</span>
+      </form>
+
+      <div className="mx-2 h-4 w-px bg-border" />
+
+      <button
+        className={cn(
+          "rounded px-2 py-1",
+          mode === "highlight" ? "bg-amber-200 text-amber-900" : "hover:bg-muted",
+        )}
+        title="Highlight current text selection"
+        onClick={() => {
+          setMode("highlight");
+          onCommitHighlight();
+        }}
+      >
+        Highlight selection
+      </button>
+      <button
+        className={cn(
+          "rounded px-2 py-1",
+          mode === "note" ? "bg-blue-200 text-blue-900" : "hover:bg-muted",
+        )}
+        title="Click on the page to drop a note"
+        onClick={() => setMode(mode === "note" ? "none" : "note")}
+      >
+        {mode === "note" ? "Click page…" : "Add note"}
+      </button>
+
+      <div className="ml-auto flex items-center gap-2">
+        <label className="flex items-center gap-1">
+          <input
+            type="checkbox"
+            checked={showExpert}
+            onChange={(e) => setShowExpert(e.target.checked)}
+          />
+          Expert annotations
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Single-page renderer: canvas + text layer + annotation layer
+// ---------------------------------------------------------------------------
+
+function PageView({
+  doc,
+  pageNumber,
+  zoom,
+  annotations,
+  activeAnnotationId,
+  onRemove,
+  onUpdate,
+  onClickPage,
+}: {
+  doc: PdfDoc;
+  pageNumber: number;
+  zoom: number;
+  annotations: Annotation[];
+  activeAnnotationId: string | null;
+  onRemove: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<Annotation>) => void;
+  onClickPage: (ev: React.MouseEvent<HTMLDivElement>) => void;
+}) {
+  const pageRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const textLayerRef = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+  const [viewport, setViewport] = useState<PdfjsViewport | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let renderTask: { cancel: () => void } | null = null;
+
+    (async () => {
+      const page: PdfPage = await doc.getPage(pageNumber);
+      if (cancelled) return;
+
+      const scale = BASE_SCALE * zoom;
+      const rawViewport = page.getViewport({ scale });
+      const viewport = rawViewport as unknown as PdfjsViewport;
+      if (pageRef.current) {
+        stashViewport(pageRef.current, viewport);
+      }
+      setViewport(viewport);
+
+      const canvas = canvasRef.current;
+      const textLayer = textLayerRef.current;
+      if (!canvas || !textLayer) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(viewport.width * dpr);
+      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      setSize({ w: viewport.width, h: viewport.height });
+
+      const ctx = canvas.getContext("2d")!;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const rp = page.render({
+        canvasContext: ctx,
+        viewport,
+        canvas,
+      } as unknown as Parameters<PdfPage["render"]>[0]);
+      renderTask = rp as unknown as { cancel: () => void };
+      try {
+        await rp.promise;
+      } catch {
+        // cancelled
+        return;
+      }
+
+      // Build the text layer. pdfjs 5.x exposes `TextLayer` from the
+      // top-level module; fall back to the classic API when unavailable.
+      textLayer.innerHTML = "";
+      textLayer.style.width = `${viewport.width}px`;
+      textLayer.style.height = `${viewport.height}px`;
+      try {
+        const pdfjs = await loadPdfjs();
+        const textContent = await page.getTextContent();
+        const TextLayerCtor = (pdfjs as unknown as {
+          TextLayer?: new (opts: {
+            textContentSource: unknown;
+            container: HTMLElement;
+            viewport: unknown;
+          }) => { render: () => Promise<void> };
+        }).TextLayer;
+        if (TextLayerCtor) {
+          const layer = new TextLayerCtor({
+            textContentSource: textContent,
+            container: textLayer,
+            viewport,
+          });
+          await layer.render();
+        } else {
+          // Classic path on older builds
+          const render = (pdfjs as unknown as {
+            renderTextLayer?: (opts: {
+              textContent: unknown;
+              container: HTMLElement;
+              viewport: unknown;
+              textDivs: HTMLElement[];
+            }) => { promise: Promise<void> };
+          }).renderTextLayer;
+          if (render) {
+            const task = render({
+              textContent,
+              container: textLayer,
+              viewport,
+              textDivs: [],
+            });
+            await task.promise;
+          }
+        }
+      } catch {
+        // text layer is best-effort
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (renderTask) {
+        try {
+          renderTask.cancel();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [doc, pageNumber, zoom]);
+
+  return (
+    <div
+      ref={pageRef}
+      data-pdf-page={pageNumber}
+      onClick={onClickPage}
+      className="relative shadow-md ring-1 ring-border bg-white"
+      style={size ? { width: size.w, height: size.h } : undefined}
+    >
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 pointer-events-none select-none"
+      />
+      <div
+        ref={textLayerRef}
+        className="pdf-text-layer absolute inset-0"
+      />
+      {size && (
+        <AnnotationLayer
+          width={size.w}
+          height={size.h}
+          annotations={annotations}
+          activeAnnotationId={activeAnnotationId}
+          viewport={viewport}
+          colorForAuthor={colorForAuthor}
+          onRemove={onRemove}
+          onUpdate={onUpdate}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+export interface PdfjsViewport {
+  width: number;
+  height: number;
+  convertToPdfPoint: (x: number, y: number) => [number, number];
+  convertToViewportRectangle: (
+    rect: [number, number, number, number],
+  ) => [number, number, number, number];
+}
+
+type WithViewport = HTMLElement & { __pdfViewport?: PdfjsViewport };
+
+function readViewport(el: HTMLElement): PdfjsViewport | null {
+  // The React PageView stores the viewport via ref; the annotation layer
+  // passes it through. For the highlight-from-selection path we dig it
+  // off the element by walking the React fiber — too fragile. Instead we
+  // stash it on the DOM node via a React effect (see AnnotationLayer).
+  const stashed = (el as WithViewport).__pdfViewport;
+  return stashed ?? null;
+}
+
+// Re-export helper used by annotation-layer to pin the viewport.
+export function stashViewport(
+  el: HTMLElement,
+  viewport: PdfjsViewport,
+): void {
+  (el as WithViewport).__pdfViewport = viewport;
+}
+
+export { type Author };

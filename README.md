@@ -28,7 +28,7 @@ It's built for scientists, analysts, and curious people who want a powerful AI w
 
 ### File management and preview
 
-- **Full sandbox file system** - Upload files and folders (drag-and-drop or file picker), create directories, rename, move, delete, and download individual files or entire directories as zip archives. Everything stays local in a `sandbox/` folder on your machine.
+- **Named projects with isolated sandboxes** - Organise work into named projects, each with its own sandbox, chat history, custom MCPs, and provenance. Switch projects from the header popover; everything stays local under `projects/<project-id>/` on your machine. Upload files and folders (drag-and-drop or file picker), create directories, rename, move, delete, and download individual files or whole directories as zip archives.
 - **Rich file preview** - Open files in tabs with intelligent viewers for each format:
   - **Code** - Syntax-highlighted, read-only CodeMirror editor with line numbers and code folding for any text file
   - **Markdown** - Rendered with math (KaTeX), Mermaid diagrams, and code highlighting
@@ -142,8 +142,13 @@ k-dense-byok/
 │   ├── agent.py          ← Main agent definition
 │   └── tools/            ← Tools Kady can use (web search, delegation, etc.)
 ├── web/                  ← Frontend (the UI you see in your browser)
-├── sandbox/              ← Workspace for files and expert tasks (created on first run)
-└── user_config/          ← Your persistent settings (custom MCP servers, etc.)
+└── projects/             ← All user work, one subdirectory per named project
+    ├── index.json        ← Project registry (names, tags, archived flag)
+    └── default/          ← The "Default" project (migrated from the legacy sandbox on first run)
+        ├── project.json  ← Project metadata
+        ├── sandbox/      ← Workspace for files and expert tasks
+        ├── custom_mcps.json  ← Per-project custom MCP servers
+        └── sessions.db   ← ADK chat history (SQLite, per project)
 ```
 
 ## Adding custom MCP servers
@@ -165,7 +170,27 @@ The editor accepts a JSON object where each key is a server name and its value i
 }
 ```
 
-Your custom servers are **merged** with the built-in defaults (docling, parallel-search) and passed to the Gemini CLI. The custom configuration is saved in `user_config/custom_mcps.json` at the project root - outside the `sandbox/` directory - so it survives sandbox deletion and app restarts.
+Your custom servers are **merged** with the built-in defaults (docling, parallel-search) and passed to the Gemini CLI. The custom configuration is saved per-project in `projects/<project-id>/custom_mcps.json` (outside that project's `sandbox/` directory) so it survives sandbox deletion and app restarts. Switching projects transparently swaps the MCP set in the UI.
+
+## Using local models with Ollama
+
+You can run Kady and the expert entirely against local models served by [Ollama](https://ollama.com) — no OpenRouter key required for those models.
+
+1. Install Ollama and start the daemon:
+   ```bash
+   # macOS / Linux
+   curl -fsSL https://ollama.com/install.sh | sh
+   ollama serve
+   ```
+2. Pull one or more models:
+   ```bash
+   ollama pull llama3.2
+   ollama pull qwen2.5-coder:7b
+   ```
+3. (Optional) If your Ollama server lives somewhere other than `http://localhost:11434`, set `OLLAMA_BASE_URL` in `kady_agent/.env`.
+4. Open the model dropdown in the chat input. Pulled models appear under the **Local (Ollama)** section at the bottom. Picking one routes both the orchestrator and the Gemini-CLI-backed expert through the local daemon.
+
+The list is populated live from `GET /api/tags`, so pulling a new model and re-opening the dropdown is enough — no app restart needed.
 
 ## Why "BYOK"?
 
@@ -230,12 +255,16 @@ These are upstream limitations of the Gemini model family and the Gemini CLI too
 
 If you hit a case where a skill isn't behaving as expected, try re-running the task since results can vary between runs. You can also switch Kady's main model (via the dropdown) to a non-Gemini model for the orchestration layer while experts continue to use Gemini under the hood.
 
+### Ollama / small local models
+
+Local models served through Ollama are supported end-to-end, but they amplify the Gemini CLI caveats above: tool-calling fidelity is noticeably weaker on sub-frontier models, and skills that rely on multi-tool choreography (browsing, running scripts, structured output) are the most fragile. If a delegation loops or ignores its skill, try a larger local model (or temporarily switch back to an OpenRouter-hosted model) before assuming the workflow is broken.
+
 ## Features in the works
 
-- Ollama local model support
 - Better utilization of Skills
-- Choose what model to use with Gemini CLI
 - Choice between Claude Code or Gemini CLI as the delegation expert
+- ~~Ollama local model support~~ - Done! See **[Using local models with Ollama](#using-local-models-with-ollama)** above.
+- ~~Choose what model to use with Gemini CLI~~ - Done! The orchestrator model selection now also drives the expert.
 - ~~Support of MCP config in the UI~~ - Done! Open **Settings > MCP Servers** to add custom servers.
 - Better UI experience tailored to scientific workflows
 - Faster PDF parsing

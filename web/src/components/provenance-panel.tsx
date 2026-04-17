@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/lib/use-agent";
+import { API_BASE, apiFetch, getActiveProjectId } from "@/lib/projects";
 import {
   buildTimeline,
   exportMethodsSection,
@@ -180,9 +181,6 @@ export function ProvenancePanel({
     return `${hrs}h ${mins}m`;
   }, [events]);
 
-  const apiBase =
-    process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000";
-
   const handleReplayConfirm = useCallback(() => {
     setReplayState({ status: "confirming", events: [] });
   }, []);
@@ -191,7 +189,7 @@ export function ProvenancePanel({
     if (!sessionId || turnIds.length === 0) return;
     setReplayState({ status: "running", events: [] });
     try {
-      const resp = await fetch(`${apiBase}/replay`, {
+      const resp = await apiFetch(`/replay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, turnIds }),
@@ -229,7 +227,7 @@ export function ProvenancePanel({
         error: exc instanceof Error ? exc.message : "Replay failed",
       }));
     }
-  }, [apiBase, sessionId, turnIds]);
+  }, [sessionId, turnIds]);
 
   const handleCopyMethods = useCallback(() => {
     const text =
@@ -444,7 +442,7 @@ export function ProvenancePanel({
                 {manifests.map((m) => (
                   <a
                     key={m.turnId}
-                    href={`${process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000"}/turns/${m.sessionId}/${m.turnId}/manifest`}
+                    href={`${API_BASE}/turns/${m.sessionId}/${m.turnId}/manifest?project=${encodeURIComponent(getActiveProjectId())}`}
                     target="_blank"
                     rel="noreferrer"
                     className="text-[10px] text-muted-foreground underline decoration-dotted hover:text-foreground"

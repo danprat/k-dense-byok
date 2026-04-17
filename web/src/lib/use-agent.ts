@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000";
+import { apiFetch, onProjectChange } from "@/lib/projects";
+
 const APP_NAME = "kady_agent";
 const USER_ID = "user";
 const MAX_ACTIVITY_ITEMS = 8;
@@ -39,12 +40,17 @@ export interface CitationReport {
 
 export type ClaimStatus = "verified" | "approximate" | "unbacked" | "ambiguous";
 
+export type ClaimSourceKind = "file" | "notebook" | "tool_output" | "none";
+
 export interface ClaimSource {
+  kind: ClaimSourceKind;
   file?: string;
   cell?: number;
   line?: number;
   value?: string;
   note?: string;
+  delegationId?: string;
+  eventIndex?: number;
 }
 
 export interface ClaimEntry {
@@ -157,14 +163,85 @@ export function useAgent() {
   const ensureSession = useCallback(async () => {
     if (sessionIdRef.current) return sessionIdRef.current;
 
-    const res = await fetch(
-      `${API_BASE}/apps/${APP_NAME}/users/${USER_ID}/sessions`,
+    const res = await apiFetch(
+      `/apps/${APP_NAME}/users/${USER_ID}/sessions`,
       { method: "POST", headers: { "Content-Type": "application/json" } }
     );
     if (!res.ok) throw new Error(`Failed to create session: ${res.status}`);
     const session = await res.json();
     sessionIdRef.current = session.id;
     return session.id as string;
+  }, []);
+
+  const loadClaims = useCallback(async (messageId: string) => {
+    const sessionId = sessionIdRef.current;
+    const snapshot = await new Promise<ChatMessage | undefined>((resolve) =>
+      setMessages((prev) => {
+        resolve(prev.find((m) => m.id === messageId));
+        return prev;
+      })
+    );
+    const turnId = snapshot?.turnId;
+    if (!sessionId || !turnId) return;
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId
+          ? { ...m, claims: { claims: [], loading: true } }
+          : m
+      )
+    );
+    try {
+      const resp = await apiFetch(
+        `/turns/${sessionId}/${turnId}/claims`
+      );
+      if (resp.status === 404) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === messageId
+              ? {
+                  ...m,
+                  claims: {
+                    claims: [],
+                    error: "No claims.json for this turn. If the expert ran code, it should have emitted one.",
+                  },
+                }
+              : m
+          )
+        );
+        return;
+      }
+      if (!resp.ok) throw new Error(`claims ${resp.status}`);
+      const data = await resp.json();
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId
+            ? {
+                ...m,
+                claims: {
+                  turnId: data.turnId,
+                  scannedAt: data.scannedAt,
+                  claims: Array.isArray(data.claims) ? data.claims : [],
+                },
+              }
+            : m
+        )
+      );
+    } catch (exc) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === messageId
+            ? {
+                ...m,
+                claims: {
+                  claims: [],
+                  error: exc instanceof Error ? exc.message : "Failed to load claims",
+                },
+              }
+            : m
+        )
+      );
+    }
   }, []);
 
   const send = useCallback(
@@ -212,7 +289,7 @@ export function useAgent() {
         if (meta?.databases?.length) stateDelta._databases = meta.databases;
         if (meta?.compute) stateDelta._compute = meta.compute;
 
-        const res = await fetch(`${API_BASE}/run_sse`, {
+        const res = await apiFetch(`/run_sse`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -430,24 +507,33 @@ export function useAgent() {
           }));
 
           let deliverables: string[] = [];
+          let producedCode = false;
           if (turnId && sessionIdRef.current) {
             try {
-              const mResp = await fetch(
-                `${API_BASE}/turns/${sessionIdRef.current}/${turnId}/manifest`
+              const mResp = await apiFetch(
+                `/turns/${sessionIdRef.current}/${turnId}/manifest`
               );
               if (mResp.ok) {
                 const manifest = await mResp.json();
                 if (Array.isArray(manifest?.output?.deliverables)) {
                   deliverables = manifest.output.deliverables;
                 }
+                producedCode = Boolean(manifest?.claims?.producedCode);
               }
             } catch {
               // best-effort
             }
           }
 
+          // If any delegation in this turn ran code, auto-fire the claims
+          // fetch. The Audit numbers button stays available as a manual
+          // fallback for turns without code.
+          if (producedCode) {
+            void loadClaims(assistantId);
+          }
+
           try {
-            const resp = await fetch(`${API_BASE}/verify-citations`, {
+            const resp = await apiFetch(`/verify-citations`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ text, files: deliverables }),
@@ -460,8 +546,8 @@ export function useAgent() {
             }));
 
             if (turnId && sessionIdRef.current) {
-              void fetch(
-                `${API_BASE}/turns/${sessionIdRef.current}/${turnId}/citations`,
+              void apiFetch(
+                `/turns/${sessionIdRef.current}/${turnId}/citations`,
                 {
                   method: "PATCH",
                   headers: { "Content-Type": "application/json" },
@@ -521,7 +607,7 @@ export function useAgent() {
 
       return userMsgId;
     },
-    [status, ensureSession]
+    [status, ensureSession, loadClaims]
   );
 
   const stop = useCallback(() => {
@@ -536,78 +622,11 @@ export function useAgent() {
     sessionIdRef.current = null;
   }, []);
 
+  // Switching projects must drop the current ADK session (it lives in a
+  // different per-project SQLite DB) and start fresh.
+  useEffect(() => onProjectChange(() => reset()), [reset]);
+
   const getSessionId = useCallback(() => sessionIdRef.current, []);
-
-  const loadClaims = useCallback(async (messageId: string) => {
-    const sessionId = sessionIdRef.current;
-    const snapshot = await new Promise<ChatMessage | undefined>((resolve) =>
-      setMessages((prev) => {
-        resolve(prev.find((m) => m.id === messageId));
-        return prev;
-      })
-    );
-    const turnId = snapshot?.turnId;
-    if (!sessionId || !turnId) return;
-
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId
-          ? { ...m, claims: { claims: [], loading: true } }
-          : m
-      )
-    );
-    try {
-      const resp = await fetch(
-        `${API_BASE}/turns/${sessionId}/${turnId}/claims`
-      );
-      if (resp.status === 404) {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === messageId
-              ? {
-                  ...m,
-                  claims: {
-                    claims: [],
-                    error: "Run the Quantitative claims auditor from the main agent to populate this turn's claims.",
-                  },
-                }
-              : m
-          )
-        );
-        return;
-      }
-      if (!resp.ok) throw new Error(`claims ${resp.status}`);
-      const data = await resp.json();
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                claims: {
-                  turnId: data.turnId,
-                  scannedAt: data.scannedAt,
-                  claims: Array.isArray(data.claims) ? data.claims : [],
-                },
-              }
-            : m
-        )
-      );
-    } catch (exc) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                claims: {
-                  claims: [],
-                  error: exc instanceof Error ? exc.message : "Failed to load claims",
-                },
-              }
-            : m
-        )
-      );
-    }
-  }, []);
 
   return { messages, status, send, stop, reset, getSessionId, loadClaims };
 }

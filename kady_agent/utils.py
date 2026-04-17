@@ -18,14 +18,19 @@ def load_instructions(agent_name: str) -> str:
     return instructions_path.read_text(encoding="utf-8")
 
 
-def list_skill_summaries(skills_dir: str = "sandbox/.gemini/skills") -> list[dict]:
+def list_skill_summaries(skills_dir: str | None = None) -> list[dict]:
     """Read skill name and description from each SKILL.md frontmatter.
 
     Returns a list of ``{"name": ..., "description": ...}`` dicts sorted by
     name, suitable for injecting into the orchestrator's instruction as a
-    reference catalogue.
+    reference catalogue. When ``skills_dir`` is omitted, resolves to the
+    active project's ``sandbox/.gemini/skills``.
     """
-    skills_path = Path(skills_dir)
+    if skills_dir is None:
+        from .projects import active_paths
+        skills_path = active_paths().gemini_settings_dir / "skills"
+    else:
+        skills_path = Path(skills_dir)
     if not skills_path.is_dir():
         return []
 
@@ -82,7 +87,7 @@ def format_skills_reference(skills: list[dict]) -> str:
 
 
 def download_scientific_skills(
-    target_dir: str = "sandbox/.gemini/skills",
+    target_dir: str | None = None,
     github_repo: str = "K-Dense-AI/scientific-agent-skills",
     source_path: str = "scientific-skills",
     branch: str = "main"
@@ -92,12 +97,17 @@ def download_scientific_skills(
     and place them in the target directory using git clone.
     
     Args:
-        target_dir: Local directory to save the skills to
+        target_dir: Local directory to save the skills to. Defaults to
+            ``<active project>/sandbox/.gemini/skills`` when omitted.
         github_repo: GitHub repository in format "owner/repo"
         source_path: Path within the repo to download from
         branch: Git branch to download from
     """
-    target_path = Path(target_dir)
+    if target_dir is None:
+        from .projects import active_paths
+        target_path = active_paths().gemini_settings_dir / "skills"
+    else:
+        target_path = Path(target_dir)
     target_path.mkdir(parents=True, exist_ok=True)
     
     # Create a temporary directory

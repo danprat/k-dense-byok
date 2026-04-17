@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000";
+import { apiFetch, onProjectChange } from "@/lib/projects";
 
 export interface Skill {
   id: string;
@@ -16,10 +16,14 @@ export interface Skill {
 export function useSkills(): { skills: Skill[]; loading: boolean } {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => onProjectChange(() => setReloadKey((v) => v + 1)), []);
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_BASE}/skills`)
+    setLoading(true);
+    apiFetch(`/skills`)
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => {
         if (!cancelled && Array.isArray(data)) {
@@ -33,7 +37,7 @@ export function useSkills(): { skills: Skill[]; loading: boolean } {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   return { skills, loading };
 }

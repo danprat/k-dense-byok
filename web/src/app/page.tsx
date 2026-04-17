@@ -34,6 +34,9 @@ import { SettingsDialog } from "@/components/settings-dialog";
 import { WorkflowsPanel } from "@/components/workflows-panel";
 import { CitationBadge } from "@/components/citation-badge";
 import { ClaimsBadge, useClaimsUnderlines } from "@/components/claims-badge";
+import { ToolOutputPopover, type ToolOutputTarget } from "@/components/tool-output-popover";
+import type { ClaimEntry } from "@/lib/use-agent";
+import { ProjectSwitcher } from "@/components/project-switcher";
 import type { ChatMessage } from "@/lib/use-agent";
 import { APP_VERSION, useUpdateCheck } from "@/lib/version";
 import { useAgent, type ActivityItem } from "@/lib/use-agent";
@@ -737,15 +740,35 @@ function ChatInput({
 function AssistantMessageBody({
   message,
   onRunClaims,
+  onClaimClick,
 }: {
   message: ChatMessage;
   onRunClaims: () => void;
+  onClaimClick: (claim: ClaimEntry, anchor: HTMLElement) => void;
 }) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
   useClaimsUnderlines(bodyRef, message.claims?.claims);
+
+  const onContainerClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const span = target.closest<HTMLElement>(".kady-claim");
+      if (!span || !bodyRef.current?.contains(span)) return;
+      const idxStr = span.dataset.claimIndex;
+      if (!idxStr) return;
+      const idx = Number(idxStr);
+      const entry = message.claims?.claims?.[idx];
+      if (!entry) return;
+      if (!entry.source || entry.source.kind === "none") return;
+      onClaimClick(entry, span);
+    },
+    [message.claims, onClaimClick]
+  );
+
   return (
     <>
-      <div ref={bodyRef}>
+      <div ref={bodyRef} onClick={onContainerClick}>
         <MessageResponse>{message.content}</MessageResponse>
       </div>
       <div className="flex flex-wrap items-center gap-2">
@@ -975,6 +998,59 @@ export default function ChatPage() {
     sandbox.selectFile(path);
   }, [sandbox]);
 
+  // Claim source dispatcher: opens the referenced file/cell in the preview
+  // panel, or a ToolOutputPopover anchored at the clicked span.
+  const [revealTarget, setRevealTarget] = useState<
+    { path: string; line?: number; cell?: number; token: number } | null
+  >(null);
+  const [toolOutputTarget, setToolOutputTarget] = useState<ToolOutputTarget | null>(null);
+  const revealTokenRef = useRef(0);
+
+  const handleClaimClick = useCallback(
+    (claim: ClaimEntry, anchor: HTMLElement) => {
+      const src = claim.source;
+      if (!src) return;
+      if (src.kind === "file" && src.file) {
+        if (!panelOpen) setPanelOpen(true);
+        sandbox.selectFile(src.file);
+        revealTokenRef.current += 1;
+        setRevealTarget({
+          path: src.file,
+          line: typeof src.line === "number" ? src.line : undefined,
+          token: revealTokenRef.current,
+        });
+        setToolOutputTarget(null);
+      } else if (src.kind === "notebook" && src.file) {
+        if (!panelOpen) setPanelOpen(true);
+        sandbox.selectFile(src.file);
+        revealTokenRef.current += 1;
+        setRevealTarget({
+          path: src.file,
+          cell: typeof src.cell === "number" ? src.cell : undefined,
+          line: typeof src.line === "number" ? src.line : undefined,
+          token: revealTokenRef.current,
+        });
+        setToolOutputTarget(null);
+      } else if (src.kind === "tool_output") {
+        const sessionId = getSessionId();
+        const turnId = messages.find((m) => m.claims?.claims?.includes(claim))?.turnId;
+        if (!sessionId || !turnId || !src.delegationId || typeof src.eventIndex !== "number") {
+          return;
+        }
+        const rect = anchor.getBoundingClientRect();
+        setToolOutputTarget({
+          sessionId,
+          turnId,
+          delegationId: src.delegationId,
+          eventIndex: src.eventIndex,
+          anchor: rect,
+          value: src.value,
+        });
+      }
+    },
+    [sandbox, panelOpen, getSessionId, messages]
+  );
+
   return (
     <div className="flex h-dvh flex-col">
       {/* Header */}
@@ -1002,6 +1078,8 @@ export default function ChatPage() {
               Update available
             </a>
           )}
+          <span className="mx-1 h-4 w-px bg-border/60" aria-hidden />
+          <ProjectSwitcher />
         </div>
         <p className="absolute left-1/2 -translate-x-1/2 text-[11px] text-muted-foreground/60 tracking-wide select-none">
           Brought to you by K-Dense, Inc.
@@ -1097,6 +1175,7 @@ export default function ChatPage() {
               onSaveImageBlob={sandbox.saveImageBlob}
               onRetry={sandbox.retryFile}
               onCompileLatex={sandbox.compileLatex}
+              revealTarget={revealTarget}
             />
           </div>
         )}
@@ -1173,6 +1252,7 @@ export default function ChatPage() {
                             <AssistantMessageBody
                               message={message}
                               onRunClaims={() => loadClaims(message.id)}
+                              onClaimClick={handleClaimClick}
                             />
                           ) : (
                             <MessageResponse>{message.content}</MessageResponse>
@@ -1254,6 +1334,13 @@ export default function ChatPage() {
           turnMeta={turnMetaRef.current}
           sessionId={getSessionId()}
           onClose={() => setProvenanceOpen(false)}
+        />
+      )}
+
+      {toolOutputTarget && (
+        <ToolOutputPopover
+          target={toolOutputTarget}
+          onClose={() => setToolOutputTarget(null)}
         />
       )}
 

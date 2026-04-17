@@ -1,10 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { CheckIcon, BrainCircuitIcon, ChevronDownIcon, SearchIcon } from "lucide-react";
+import { CheckIcon, BrainCircuitIcon, ChevronDownIcon, SearchIcon, HardDriveIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import models from "@/data/models.json";
+import { useModels } from "@/lib/use-models";
 
 export type Model = {
   id: string;
@@ -18,9 +19,9 @@ export type Model = {
   default?: boolean;
 };
 
-const ALL_MODELS = models as Model[];
+const STATIC_MODELS = models as Model[];
 
-const DEFAULT_MODEL = ALL_MODELS.find((m) => m.default) ?? ALL_MODELS[0];
+const DEFAULT_MODEL = STATIC_MODELS.find((m) => m.default) ?? STATIC_MODELS[0];
 
 const TIER_STYLES: Record<string, { dot: string; badge: string }> = {
   budget:   { dot: "bg-slate-400",  badge: "text-slate-500 dark:text-slate-400" },
@@ -36,7 +37,10 @@ const PROVIDER_COLORS: Record<string, string> = {
   DeepSeek:  "text-cyan-600 dark:text-cyan-400",
   xAI:       "text-rose-600 dark:text-rose-400",
   Meta:      "text-indigo-600 dark:text-indigo-400",
+  Ollama:    "text-teal-600 dark:text-teal-400",
 };
+
+const isOllama = (m: Model) => m.provider === "Ollama" || m.id.startsWith("ollama/");
 
 function TierDot({ tier }: { tier: string }) {
   return (
@@ -61,22 +65,84 @@ export function ModelSelector({
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const { models: allModels, ollamaAvailable, ollamaModels } = useModels();
 
-  const filtered = useMemo(() => {
-    if (!search) return ALL_MODELS;
+  const { remoteFiltered, localFiltered, totalCount } = useMemo(() => {
     const q = search.toLowerCase();
-    return ALL_MODELS.filter(
-      (m) =>
-        m.label.toLowerCase().includes(q) ||
-        m.provider.toLowerCase().includes(q) ||
-        m.id.toLowerCase().includes(q)
-    );
-  }, [search]);
+    const matches = (m: Model) =>
+      !q ||
+      m.label.toLowerCase().includes(q) ||
+      m.provider.toLowerCase().includes(q) ||
+      m.id.toLowerCase().includes(q);
+
+    const remote: Model[] = [];
+    const local: Model[] = [];
+    for (const m of allModels) {
+      if (!matches(m)) continue;
+      (isOllama(m) ? local : remote).push(m);
+    }
+    return { remoteFiltered: remote, localFiltered: local, totalCount: remote.length + local.length };
+  }, [allModels, search]);
 
   const handleSelect = (model: Model) => {
     onChange(model);
     setOpen(false);
     setSearch("");
+  };
+
+  const renderModelRow = (model: Model) => {
+    const isSelected = selected.id === model.id;
+    const providerColor = PROVIDER_COLORS[model.provider] ?? "text-muted-foreground";
+    const local = isOllama(model);
+    return (
+      <div
+        key={model.id}
+        onClick={() => handleSelect(model)}
+        className={cn(
+          "flex cursor-pointer items-start gap-2.5 px-3 py-2.5 text-xs transition-colors hover:bg-muted/60",
+          isSelected && "bg-muted/40"
+        )}
+      >
+        <div
+          className={cn(
+            "mt-0.5 flex size-3.5 shrink-0 items-center justify-center rounded-full border transition-colors",
+            isSelected
+              ? "border-primary bg-primary text-primary-foreground"
+              : "border-border bg-background"
+          )}
+        >
+          {isSelected && <CheckIcon className="size-2" />}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <TierDot tier={model.tier} />
+            <span className="font-semibold text-foreground">{model.label}</span>
+            {model.default && (
+              <span className="rounded-full bg-primary/10 px-1.5 py-px text-[10px] font-medium text-primary">
+                recommended
+              </span>
+            )}
+            <span className={cn("text-[10px] font-medium", providerColor)}>
+              {model.provider}
+            </span>
+          </div>
+          <div className="mt-0.5 flex items-center gap-2 text-[10px] text-muted-foreground/70">
+            {model.context_length > 0 && (
+              <>
+                <span>{formatContext(model.context_length)}</span>
+                <span>·</span>
+              </>
+            )}
+            {local ? (
+              <span>Runs locally · no API cost</span>
+            ) : (
+              <span>${model.pricing.prompt.toFixed(2)} in / ${model.pricing.completion.toFixed(2)} out per 1M tok</span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -121,56 +187,41 @@ export function ModelSelector({
             autoFocus
           />
           <span className="text-[10px] text-muted-foreground tabular-nums">
-            {filtered.length}
+            {totalCount}
           </span>
         </div>
 
         <div className="max-h-80 overflow-y-auto py-1">
-          {filtered.map((model) => {
-            const isSelected = selected.id === model.id;
-            const providerColor = PROVIDER_COLORS[model.provider] ?? "text-muted-foreground";
-            return (
-              <div
-                key={model.id}
-                onClick={() => handleSelect(model)}
-                className={cn(
-                  "flex cursor-pointer items-start gap-2.5 px-3 py-2.5 text-xs transition-colors hover:bg-muted/60",
-                  isSelected && "bg-muted/40"
-                )}
-              >
-                <div
-                  className={cn(
-                    "mt-0.5 flex size-3.5 shrink-0 items-center justify-center rounded-full border transition-colors",
-                    isSelected
-                      ? "border-primary bg-primary text-primary-foreground"
-                      : "border-border bg-background"
-                  )}
-                >
-                  {isSelected && <CheckIcon className="size-2" />}
-                </div>
+          {remoteFiltered.map(renderModelRow)}
 
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <TierDot tier={model.tier} />
-                    <span className="font-semibold text-foreground">{model.label}</span>
-                    {model.default && (
-                      <span className="rounded-full bg-primary/10 px-1.5 py-px text-[10px] font-medium text-primary">
-                        recommended
-                      </span>
-                    )}
-                    <span className={cn("text-[10px] font-medium", providerColor)}>
-                      {model.provider}
-                    </span>
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-2 text-[10px] text-muted-foreground/70">
-                    <span>{formatContext(model.context_length)}</span>
-                    <span>·</span>
-                    <span>${model.pricing.prompt.toFixed(2)} in / ${model.pricing.completion.toFixed(2)} out per 1M tok</span>
-                  </div>
-                </div>
+          {(localFiltered.length > 0 || (!search && ollamaAvailable && ollamaModels.length === 0)) && (
+            <>
+              {remoteFiltered.length > 0 && (
+                <div className="my-1 border-t border-border/60" />
+              )}
+              <div className="flex items-center gap-1.5 px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                <HardDriveIcon className="size-3" />
+                <span>Local (Ollama)</span>
+                <span className="ml-auto font-normal normal-case tracking-normal text-[10px] text-muted-foreground/70">
+                  {ollamaAvailable ? `${ollamaModels.length} available` : "not running"}
+                </span>
               </div>
-            );
-          })}
+              {localFiltered.map(renderModelRow)}
+              {ollamaAvailable && ollamaModels.length === 0 && !search && (
+                <div className="px-3 py-2 text-[11px] text-muted-foreground/80">
+                  Ollama is running but no models are pulled yet. Run{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-[10px]">ollama pull llama3.2</code>{" "}
+                  to add one.
+                </div>
+              )}
+            </>
+          )}
+
+          {totalCount === 0 && (
+            <div className="px-3 py-6 text-center text-[11px] text-muted-foreground">
+              No models match &ldquo;{search}&rdquo;.
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-3 border-t px-3 py-1.5 flex-wrap">

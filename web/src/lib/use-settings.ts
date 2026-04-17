@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000";
+import { apiFetch, onProjectChange } from "@/lib/projects";
 
 export interface UseCustomMcpsReturn {
   /** Raw JSON string of the user's custom MCP servers. */
@@ -28,7 +28,7 @@ export function useCustomMcps(): UseCustomMcpsReturn {
   const fetchMcps = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetch(`${API_BASE}/settings/mcps`)
+    apiFetch(`/settings/mcps`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((data) => {
         setValue(JSON.stringify(data, null, 2));
@@ -40,6 +40,8 @@ export function useCustomMcps(): UseCustomMcpsReturn {
   useEffect(() => {
     fetchMcps();
   }, [fetchMcps]);
+
+  useEffect(() => onProjectChange(() => fetchMcps()), [fetchMcps]);
 
   const save = useCallback(async (json: string): Promise<boolean> => {
     setError(null);
@@ -57,7 +59,7 @@ export function useCustomMcps(): UseCustomMcpsReturn {
 
     setSaving(true);
     try {
-      const res = await fetch(`${API_BASE}/settings/mcps`, {
+      const res = await apiFetch(`/settings/mcps`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: json,

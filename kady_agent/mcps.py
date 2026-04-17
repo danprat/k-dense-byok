@@ -75,8 +75,8 @@ def _make_toolset(name: str, spec: dict) -> ResilientMcpToolset | None:
 
 
 class DynamicCustomMcpToolset(BaseToolset):
-    """Reads ``user_config/custom_mcps.json`` on every agent turn and
-    lazily creates / caches MCP connections for each entry.
+    """Reads the active project's ``custom_mcps.json`` on every agent turn
+    and lazily creates / caches MCP connections for each entry.
 
     When the config file changes between turns the stale connections are
     torn down and new ones are established automatically — no server

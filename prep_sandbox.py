@@ -1,49 +1,53 @@
-import os
-import shutil
-import subprocess
+"""One-shot sandbox bootstrap for every known project.
 
-from kady_agent.gemini_settings import write_merged_settings
-from kady_agent.utils import download_scientific_skills
+Historically this script set up a single ``sandbox/`` folder. Now that each
+project has its own isolated sandbox under ``projects/<id>/sandbox/``, this
+script:
 
-SANDBOX_DIR = "sandbox"
-GEMINI_CLI_MD = os.path.join("kady_agent", "instructions", "gemini_cli.md")
-SANDBOX_VENV = os.path.join(SANDBOX_DIR, ".venv")
-SANDBOX_PYPROJECT = os.path.join(SANDBOX_DIR, "pyproject.toml")
+1. Migrates the legacy ``sandbox/`` + ``user_config/custom_mcps.json`` into
+   ``projects/default/`` on first run (idempotent - no-op afterwards).
+2. Runs the heavy sandbox init (copy GEMINI.md, merge Gemini settings,
+   seed pyproject.toml, ``uv sync``, download scientific skills) for every
+   non-archived project in the registry.
 
-_PYPROJECT_TEMPLATE = """\
-[project]
-name = "kady-sandbox"
-version = "0.1.2"
-description = "Packages installed by Kady expert agents"
-requires-python = ">=3.13"
-dependencies = [
-    "dask>=2026.3.0",
-    "docling>=2.81.0",
-    "markitdown[all]>=0.1.5",
-    "matplotlib>=3.10.8",
-    "modal>=1.3.5",
-    "numpy>=2.4.3",
-    "openrouter>=0.7.11",
-    "polars>=1.39.3",
-    "pyopenms>=3.5.0",
-    "scipy>=1.17.1",
-    "transformers>=4.57.6",
-    "parallel-web-tools[cli]>=0.2.0",
-]
+Running this is safe and idempotent; it can be re-invoked any time a new
+dependency is added to the sandbox pyproject template.
 """
 
-os.makedirs(SANDBOX_DIR, exist_ok=True)
+from __future__ import annotations
 
-shutil.copy2(GEMINI_CLI_MD, os.path.join(SANDBOX_DIR, "GEMINI.md"))
+from kady_agent.projects import (
+    DEFAULT_PROJECT_ID,
+    ensure_project_exists,
+    init_project_sandbox,
+    list_projects,
+    migrate_legacy_layout,
+)
 
-write_merged_settings(os.path.join(SANDBOX_DIR, ".gemini"))
 
-if not os.path.isfile(SANDBOX_PYPROJECT):
-    print("Seeding sandbox pyproject.toml...")
-    with open(SANDBOX_PYPROJECT, "w") as f:
-        f.write(_PYPROJECT_TEMPLATE)
+def main() -> None:
+    migrated = migrate_legacy_layout()
+    if migrated:
+        print("Migrated legacy sandbox/ + user_config/ into projects/default/.")
 
-print("Syncing sandbox Python environment...")
-subprocess.run(["uv", "sync"], check=True, cwd=SANDBOX_DIR)
+    # Guarantee the default project exists even on a fresh checkout where
+    # there was no legacy layout to migrate.
+    ensure_project_exists(DEFAULT_PROJECT_ID)
 
-download_scientific_skills(target_dir="sandbox/.gemini/skills")
+    projects = list_projects()
+    if not projects:
+        # Defensive: list_projects() self-heals from on-disk state, so this
+        # branch means the registry truly is empty. Seed the default.
+        ensure_project_exists(DEFAULT_PROJECT_ID)
+        projects = list_projects()
+
+    for meta in projects:
+        if meta.archived:
+            print(f"Skipping archived project: {meta.id}")
+            continue
+        print(f"== Initializing project: {meta.id} ({meta.name}) ==")
+        init_project_sandbox(meta.id)
+
+
+if __name__ == "__main__":
+    main()

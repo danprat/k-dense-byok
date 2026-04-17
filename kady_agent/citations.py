@@ -28,10 +28,18 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .projects import active_paths
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SANDBOX_ROOT = (REPO_ROOT / "sandbox").resolve()
-CACHE_PATH = SANDBOX_ROOT / ".kady" / "citation-cache.json"
 CACHE_TTL_SECONDS = 30 * 24 * 3600
+
+
+def _cache_path() -> Path:
+    return active_paths().citation_cache
+
+
+def _sandbox_root() -> Path:
+    return active_paths().sandbox
 
 _DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\"<>)\]}]+", re.IGNORECASE)
 _ARXIV_NEW_RE = re.compile(r"arXiv:(\d{4}\.\d{4,5})(v\d+)?", re.IGNORECASE)
@@ -124,10 +132,11 @@ def extract_citations(text: str) -> list[CitationEntry]:
 
 
 def _load_cache() -> dict[str, dict]:
-    if not CACHE_PATH.is_file():
+    cache_path = _cache_path()
+    if not cache_path.is_file():
         return {}
     try:
-        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return {}
         return data
@@ -136,9 +145,10 @@ def _load_cache() -> dict[str, dict]:
 
 
 def _save_cache(cache: dict[str, dict]) -> None:
+    cache_path = _cache_path()
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -365,18 +375,20 @@ async def verify_text_and_files(
 ) -> CitationReport:
     """Extract citations from text + listed sandbox files, then resolve all.
 
-    Files are resolved relative to SANDBOX_ROOT and must stay inside it; any
-    path traversal is silently skipped. Files outside SCANNABLE_EXTENSIONS are
-    ignored so we don't try to parse binary deliverables for citations.
+    Files are resolved relative to the active project's sandbox and must
+    stay inside it; any path traversal is silently skipped. Files outside
+    SCANNABLE_EXTENSIONS are ignored so we don't try to parse binary
+    deliverables for citations.
     """
     combined = text or ""
+    sandbox_root = _sandbox_root()
 
     for rel in files:
         if not rel:
             continue
-        resolved = (SANDBOX_ROOT / rel).resolve()
+        resolved = (sandbox_root / rel).resolve()
         try:
-            resolved.relative_to(SANDBOX_ROOT)
+            resolved.relative_to(sandbox_root)
         except ValueError:
             continue
         if resolved.suffix.lower() not in SCANNABLE_EXTENSIONS:

@@ -2,8 +2,20 @@
 
 import { MessageResponse } from "@/components/ai-elements/message";
 import { LatexEditor } from "@/components/latex-editor";
+import { PdfViewer } from "@/components/pdf-viewer/pdf-viewer";
+import {
+  MarkdownRevisePopover,
+  RevisePill,
+} from "@/components/markdown-revise-popover";
 import { cn } from "@/lib/utils";
-import { fileCategory, rawFileUrl, type Tab, type LatexCompileResult } from "@/lib/use-sandbox";
+import {
+  fileCategory,
+  rawFileUrl,
+  anndataSummaryUrl,
+  anndataEmbeddingUrl,
+  type Tab,
+  type LatexCompileResult,
+} from "@/lib/use-sandbox";
 import CodeMirror, { EditorView } from "@uiw/react-codemirror";
 import { loadLanguage, type LanguageName } from "@uiw/codemirror-extensions-langs";
 import { githubLight } from "@uiw/codemirror-theme-github";
@@ -62,6 +74,9 @@ function iconForFile(name: string, iconSize = "size-4"): ReactNode {
   const fastaExts = ["fasta","fa","faa","fna","ffn","fastq","fq"];
   const biotableExts = ["vcf","bed","gff","gtf","gff3","sam","bcf","tsv"];
 
+  if (name.toLowerCase().endsWith(".h5ad") || name.toLowerCase().endsWith(".h5ad.gz")) {
+    return <DatabaseIcon className={`${iconSize} text-indigo-500`} />;
+  }
   if (ext === "json" || ext === "jsonl") return <FileJsonIcon className={`${iconSize} text-amber-600`} />;
   if (ext === "pdf") return <FileTextIcon className={`${iconSize} text-red-500`} />;
   if (ext === "ipynb") return <BookOpenIcon className={`${iconSize} text-orange-500`} />;
@@ -101,6 +116,7 @@ function categoryLabel(name: string): string {
   if (cat === "latex") return "latex";
   if (cat === "fasta") return ext === "fastq" || ext === "fq" ? "fastq" : "fasta";
   if (cat === "biotable") return ext;
+  if (cat === "anndata") return "anndata";
   return langForFile(name);
 }
 
@@ -321,11 +337,16 @@ function ReadOnlyCodeView({
   content,
   name,
   className,
+  revealLine,
+  revealToken,
 }: {
   content: string;
   name: string;
   className?: string;
+  revealLine?: number;
+  revealToken?: number;
 }) {
+  const editorViewRef = useRef<EditorView | null>(null);
   const extensions = useMemo(() => {
     const lang = langExtension(name);
     return [
@@ -335,6 +356,22 @@ function ReadOnlyCodeView({
     ];
   }, [name]);
 
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view || !revealLine || revealLine < 1) return;
+    const doc = view.state.doc;
+    const safeLine = Math.min(revealLine, doc.lines);
+    try {
+      const pos = doc.line(safeLine).from;
+      view.dispatch({
+        effects: EditorView.scrollIntoView(pos, { y: "center" }),
+        selection: { anchor: pos, head: pos },
+      });
+    } catch {
+      // ignore out-of-range scroll requests
+    }
+  }, [revealLine, revealToken, content]);
+
   return (
     <CodeMirror
       value={content}
@@ -343,6 +380,9 @@ function ReadOnlyCodeView({
       editable={false}
       readOnly
       height="100%"
+      onCreateEditor={(view) => {
+        editorViewRef.current = view;
+      }}
       className={cn(
         "text-xs [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-gutters]:bg-muted/20 [&_.cm-activeLine]:bg-transparent [&_.cm-activeLineGutter]:bg-transparent",
         className,
@@ -407,11 +447,222 @@ function FileLoadError({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Markdown "Ask Kady to revise" — source-mapping helper and viewer component
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a selection string (as seen in the rendered markdown) back to a
+ * `{from, to}` range in the raw source. First tries a unique exact match;
+ * otherwise collapses consecutive whitespace on both sides so that wrapping
+ * / indentation differences don't block the match. Returns `null` when no
+ * unambiguous range can be found.
+ */
+function findSelectionInSource(
+  source: string,
+  selected: string,
+): { from: number; to: number } | null {
+  if (!selected.trim()) return null;
+
+  // Unique exact match wins.
+  const first = source.indexOf(selected);
+  if (first !== -1) {
+    const second = source.indexOf(selected, first + 1);
+    if (second === -1) return { from: first, to: first + selected.length };
+  }
+
+  // Normalize both source and needle by collapsing runs of whitespace to a
+  // single space, while keeping a map from normalized index back to source
+  // index so we can recover the precise range.
+  const map: number[] = [];
+  let normalized = "";
+  let prevSpace = false;
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (/\s/.test(c)) {
+      if (!prevSpace && normalized.length > 0) {
+        normalized += " ";
+        map.push(i);
+      }
+      prevSpace = true;
+    } else {
+      normalized += c;
+      map.push(i);
+      prevSpace = false;
+    }
+  }
+
+  const needle = selected.replace(/\s+/g, " ").trim();
+  if (!needle) return null;
+
+  // Collect all occurrences; bail if zero or if too ambiguous (>5 hits).
+  const hits: number[] = [];
+  let idx = normalized.indexOf(needle);
+  while (idx !== -1) {
+    hits.push(idx);
+    idx = normalized.indexOf(needle, idx + 1);
+    if (hits.length > 5) return null;
+  }
+  if (hits.length === 0) return null;
+
+  // Multiple hits → prefer the first one (stable, predictable). This is a
+  // pragmatic choice; the typical case is prose that appears uniquely.
+  const startNorm = hits[0];
+  const endNorm = startNorm + needle.length - 1;
+  if (endNorm >= map.length) return null;
+  return { from: map[startNorm], to: map[endNorm] + 1 };
+}
+
+interface ReviseTarget {
+  anchorRect: DOMRect;
+  selection: string;
+  from: number;
+  to: number;
+  before: string;
+  after: string;
+}
+
+function MarkdownViewer({
+  path,
+  content,
+  onSave,
+}: {
+  path: string;
+  content: string;
+  onSave: (content: string) => Promise<boolean>;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [pendingSelection, setPendingSelection] = useState<{
+    text: string;
+    rect: DOMRect;
+  } | null>(null);
+  const [target, setTarget] = useState<ReviseTarget | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  // Track selection changes whose range is entirely inside the rendered
+  // markdown container. Show a floating pill near the selection end; when
+  // the user collapses the selection the pill disappears.
+  useEffect(() => {
+    const handle = () => {
+      if (target) return; // popover open — don't re-track
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        setPendingSelection(null);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      const container = containerRef.current;
+      if (!container) {
+        setPendingSelection(null);
+        return;
+      }
+      if (
+        !container.contains(range.startContainer) ||
+        !container.contains(range.endContainer)
+      ) {
+        setPendingSelection(null);
+        return;
+      }
+      const text = sel.toString();
+      if (!text.trim()) {
+        setPendingSelection(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      // Zero-sized rects happen mid-drag; ignore until the selection settles.
+      if (rect.width === 0 && rect.height === 0) return;
+      setPendingSelection({ text, rect });
+    };
+
+    document.addEventListener("selectionchange", handle);
+    return () => document.removeEventListener("selectionchange", handle);
+  }, [target]);
+
+  const openPopover = useCallback(() => {
+    if (!pendingSelection) return;
+    const range = findSelectionInSource(content, pendingSelection.text);
+    if (!range) {
+      setToast(
+        "Couldn't locate that selection in the source. Switch to Edit mode to revise it.",
+      );
+      setPendingSelection(null);
+      setTimeout(() => setToast(null), 4000);
+      return;
+    }
+    setTarget({
+      anchorRect: pendingSelection.rect,
+      selection: content.slice(range.from, range.to),
+      from: range.from,
+      to: range.to,
+      before: content.slice(Math.max(0, range.from - 800), range.from),
+      after: content.slice(range.to, range.to + 800),
+    });
+    setPendingSelection(null);
+  }, [pendingSelection, content]);
+
+  const closePopover = useCallback(() => {
+    setTarget(null);
+  }, []);
+
+  const acceptRevision = useCallback(
+    async (revised: string) => {
+      if (!target) return;
+      const next =
+        content.slice(0, target.from) + revised + content.slice(target.to);
+      setTarget(null);
+      const ok = await onSave(next);
+      if (!ok) {
+        setToast("Failed to save revision to disk.");
+        setTimeout(() => setToast(null), 4000);
+      }
+    },
+    [target, content, onSave],
+  );
+
+  return (
+    <div
+      ref={containerRef}
+      className="h-full overflow-auto p-6 text-sm [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
+    >
+      <MessageResponse>{resolveMarkdownImageUrls(content, path)}</MessageResponse>
+
+      {pendingSelection && !target && (
+        <RevisePill anchorRect={pendingSelection.rect} onClick={openPopover} />
+      )}
+
+      {target && (
+        <MarkdownRevisePopover
+          anchorRect={target.anchorRect}
+          selection={target.selection}
+          before={target.before}
+          after={target.after}
+          filePath={path}
+          onAccept={acceptRevision}
+          onClose={closePopover}
+        />
+      )}
+
+      {toast && (
+        <div
+          className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border bg-background px-3 py-2 text-xs text-foreground shadow-lg"
+          role="status"
+        >
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FileViewer({
-  path, name, content, loading, onRetry,
+  path, name, content, loading, onRetry, onSave, revealLine, revealCell, revealToken,
 }: {
   path: string; name: string | null; content: string | null; loading: boolean;
   onRetry?: () => void;
+  onSave?: (content: string) => Promise<boolean>;
+  revealLine?: number;
+  revealCell?: number;
+  revealToken?: number;
 }) {
   if (loading) {
     return (
@@ -436,10 +687,18 @@ function FileViewer({
     );
   }
   if (cat === "pdf") {
-    return <iframe src={rawFileUrl(path)} title={name ?? "PDF"} className="h-full w-full" />;
+    return <PdfViewer path={path} />;
+  }
+  if (cat === "anndata") {
+    return <AnnDataViewer path={path} />;
   }
   if (content === null) return null;
   if (cat === "markdown") {
+    if (onSave) {
+      return <MarkdownViewer path={path} content={content} onSave={onSave} />;
+    }
+    // Fallback when no save handler was plumbed through (shouldn't happen in
+    // practice, but keeps the renderer pure if the panel is used read-only).
     return (
       <div className="h-full overflow-auto p-6 text-sm [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
         <MessageResponse>{resolveMarkdownImageUrls(content, path)}</MessageResponse>
@@ -447,7 +706,14 @@ function FileViewer({
     );
   }
   if (cat === "csv") return <CsvViewer content={content} />;
-  if (cat === "notebook") return <NotebookViewer content={content} />;
+  if (cat === "notebook") return (
+    <NotebookViewer
+      content={content}
+      revealCell={revealCell}
+      revealLine={revealLine}
+      revealToken={revealToken}
+    />
+  );
   if (cat === "fasta") {
     const ext = name?.split(".").pop()?.toLowerCase() ?? "";
     return <FastaViewer content={content} isQ={ext === "fastq" || ext === "fq"} />;
@@ -457,7 +723,13 @@ function FileViewer({
     return <BioTableViewer content={content} ext={ext} />;
   }
   return (
-    <ReadOnlyCodeView content={content} name={name ?? "text"} className="h-full" />
+    <ReadOnlyCodeView
+      content={content}
+      name={name ?? "text"}
+      className="h-full"
+      revealLine={revealLine}
+      revealToken={revealToken}
+    />
   );
 }
 
@@ -562,13 +834,28 @@ function NotebookOutput({ out }: { out: NbOutput }) {
   return null;
 }
 
-function NotebookCell({ cell, index, lang }: { cell: NbCell; index: number; lang: string }) {
+function NotebookCell({
+  cell, index, lang, highlighted, revealLine, revealToken,
+}: {
+  cell: NbCell;
+  index: number;
+  lang: string;
+  highlighted?: boolean;
+  revealLine?: number;
+  revealToken?: number;
+}) {
   const source = nbText(cell.source);
   const [collapsed, setCollapsed] = useState(false);
 
   if (cell.cell_type === "markdown") {
     return (
-      <div className="px-1 py-1 text-sm [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+      <div
+        data-cell-index={index}
+        className={cn(
+          "px-1 py-1 text-sm [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+          highlighted && "rounded-md ring-2 ring-primary/40"
+        )}
+      >
         <MessageResponse>{source}</MessageResponse>
       </div>
     );
@@ -578,7 +865,13 @@ function NotebookCell({ cell, index, lang }: { cell: NbCell; index: number; lang
     const execCount = cell.execution_count;
     const outputs = cell.outputs ?? [];
     return (
-      <div className="rounded-md border overflow-hidden bg-background">
+      <div
+        data-cell-index={index}
+        className={cn(
+          "rounded-md border overflow-hidden bg-background",
+          highlighted && "ring-2 ring-primary/40"
+        )}
+      >
         {/* Cell header */}
         <div className="flex items-center gap-2 border-b bg-muted/20 px-3 py-1">
           <span className="shrink-0 font-mono text-[10px] text-muted-foreground/60 w-12">
@@ -597,7 +890,12 @@ function NotebookCell({ cell, index, lang }: { cell: NbCell; index: number; lang
           )}
         </div>
         {/* Source */}
-        <ReadOnlyCodeView content={source} name={`cell.${lang === "python" ? "py" : lang}`} />
+        <ReadOnlyCodeView
+          content={source}
+          name={`cell.${lang === "python" ? "py" : lang}`}
+          revealLine={highlighted ? revealLine : undefined}
+          revealToken={highlighted ? revealToken : undefined}
+        />
         {/* Outputs */}
         {!collapsed && outputs.map((out, i) => <NotebookOutput key={i} out={out} />)}
       </div>
@@ -606,14 +904,42 @@ function NotebookCell({ cell, index, lang }: { cell: NbCell; index: number; lang
 
   // raw cell
   return (
-    <pre className="rounded border bg-muted/10 p-3 text-xs font-mono text-muted-foreground">{source}</pre>
+    <pre
+      data-cell-index={index}
+      className={cn(
+        "rounded border bg-muted/10 p-3 text-xs font-mono text-muted-foreground",
+        highlighted && "ring-2 ring-primary/40"
+      )}
+    >
+      {source}
+    </pre>
   );
 }
 
-function NotebookViewer({ content }: { content: string }) {
+function NotebookViewer({
+  content, revealCell, revealLine, revealToken,
+}: {
+  content: string;
+  revealCell?: number;
+  revealLine?: number;
+  revealToken?: number;
+}) {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
   const nb = useMemo<Notebook | null>(() => {
     try { return JSON.parse(content) as Notebook; } catch { return null; }
   }, [content]);
+
+  useEffect(() => {
+    if (revealCell === undefined) return;
+    const root = scrollerRef.current;
+    if (!root) return;
+    const target = root.querySelector<HTMLElement>(
+      `[data-cell-index="${revealCell}"]`
+    );
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [revealCell, revealToken, content]);
 
   if (!nb) return (
     <div className="flex h-full items-center justify-center text-sm text-red-500">
@@ -631,7 +957,7 @@ function NotebookViewer({ content }: { content: string }) {
   const mdCells = cells.filter(c => c.cell_type === "markdown").length;
 
   return (
-    <div className="h-full overflow-auto">
+    <div ref={scrollerRef} className="h-full overflow-auto">
       {/* Notebook meta bar */}
       <div className="sticky top-0 z-10 flex items-center gap-3 border-b bg-background/95 px-4 py-2 backdrop-blur">
         <BookOpenIcon className="size-4 text-orange-500 shrink-0" />
@@ -644,7 +970,15 @@ function NotebookViewer({ content }: { content: string }) {
       {/* Cells */}
       <div className="mx-auto max-w-4xl space-y-3 px-4 py-4">
         {cells.slice(0, 300).map((cell, i) => (
-          <NotebookCell key={i} cell={cell} index={i} lang={lang} />
+          <NotebookCell
+            key={i}
+            cell={cell}
+            index={i}
+            lang={lang}
+            highlighted={revealCell === i}
+            revealLine={revealCell === i ? revealLine : undefined}
+            revealToken={revealToken}
+          />
         ))}
         {cells.length > 300 && (
           <p className="text-center text-xs text-muted-foreground py-2">
@@ -938,11 +1272,13 @@ function BioTableViewer({ content, ext }: { content: string; ext: string }) {
 // ---------------------------------------------------------------------------
 
 function TextEditor({
+  path,
   name,
   initialContent,
   onSave,
   onDiscard,
 }: {
+  path: string;
   name: string;
   initialContent: string;
   onSave: (content: string) => Promise<boolean>;
@@ -952,9 +1288,25 @@ function TextEditor({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const isDirty = content !== initialContent;
+  const isMarkdown = fileCategory(name) === "markdown";
 
   // Use a ref so the keymap closure never goes stale
   const handleSaveRef = useRef<() => void>(() => {});
+  const viewRef = useRef<EditorView | null>(null);
+
+  // Revise-popover plumbing (only meaningful for markdown files). `pending`
+  // tracks the live selection that should show the pill; `target` is the
+  // snapshot captured when the pill is clicked, frozen while the popover
+  // is open so the CodeMirror selection can collapse freely.
+  const [pending, setPending] = useState<
+    { text: string; rect: DOMRect; from: number; to: number } | null
+  >(null);
+  const [target, setTarget] = useState<ReviseTarget | null>(null);
+
+  const isMarkdownRef = useRef(isMarkdown);
+  isMarkdownRef.current = isMarkdown;
+  const targetActiveRef = useRef(false);
+  targetActiveRef.current = target !== null;
 
   const handleSave = useCallback(async () => {
     setSaving(true);
@@ -965,14 +1317,88 @@ function TextEditor({
 
   handleSaveRef.current = handleSave;
 
+  // Selection listener: fires on every CodeMirror update but we only react
+  // when the selection moved or the doc changed, and only for markdown docs.
+  // Stored in a memo so it doesn't re-attach on each render (which would
+  // reset the editor state).
+  const selectionListener = useMemo(
+    () =>
+      EditorView.updateListener.of((update) => {
+        if (!isMarkdownRef.current) return;
+        if (targetActiveRef.current) return;
+        if (!update.selectionSet && !update.docChanged) return;
+
+        const view = update.view;
+        const sel = view.state.selection.main;
+        if (sel.empty) {
+          setPending(null);
+          return;
+        }
+        const text = view.state.doc.sliceString(sel.from, sel.to);
+        if (!text.trim()) {
+          setPending(null);
+          return;
+        }
+        const startCoords = view.coordsAtPos(sel.from);
+        const endCoords = view.coordsAtPos(sel.to);
+        if (!startCoords || !endCoords) {
+          setPending(null);
+          return;
+        }
+        const left = Math.min(startCoords.left, endCoords.left);
+        const right = Math.max(startCoords.right, endCoords.right);
+        const top = Math.min(startCoords.top, endCoords.top);
+        const bottom = Math.max(startCoords.bottom, endCoords.bottom);
+        const rect = new DOMRect(left, top, right - left, bottom - top);
+        setPending({ text, rect, from: sel.from, to: sel.to });
+      }),
+    [],
+  );
+
   const extensions = useMemo(() => {
     const lang = langExtension(name);
     return [
       ...(lang ? [lang] : []),
       EditorView.lineWrapping,
+      selectionListener,
       keymap.of([{ key: "Mod-s", run: () => { handleSaveRef.current(); return true; } }]),
     ];
-  }, [name]);
+  }, [name, selectionListener]);
+
+  const openPopover = useCallback(() => {
+    if (!pending) return;
+    setTarget({
+      anchorRect: pending.rect,
+      selection: pending.text,
+      from: pending.from,
+      to: pending.to,
+      before: content.slice(Math.max(0, pending.from - 800), pending.from),
+      after: content.slice(pending.to, pending.to + 800),
+    });
+    setPending(null);
+  }, [pending, content]);
+
+  const closePopover = useCallback(() => setTarget(null), []);
+
+  const acceptRevision = useCallback(
+    (revised: string) => {
+      if (!target) return;
+      const view = viewRef.current;
+      if (view) {
+        view.dispatch({
+          changes: { from: target.from, to: target.to, insert: revised },
+          selection: { anchor: target.from + revised.length },
+        });
+      } else {
+        // Fallback if the view ref hasn't attached yet (shouldn't happen).
+        setContent(
+          (prev) => prev.slice(0, target.from) + revised + prev.slice(target.to),
+        );
+      }
+      setTarget(null);
+    },
+    [target],
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -1009,6 +1435,7 @@ function TextEditor({
             theme={githubLight}
             height="100%"
             className="h-full text-xs [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto"
+            onCreateEditor={(view) => { viewRef.current = view; }}
             basicSetup={{
               lineNumbers: true,
               highlightActiveLine: true,
@@ -1021,6 +1448,21 @@ function TextEditor({
           />
         </div>
       </div>
+
+      {isMarkdown && pending && !target && (
+        <RevisePill anchorRect={pending.rect} onClick={openPopover} />
+      )}
+      {isMarkdown && target && (
+        <MarkdownRevisePopover
+          anchorRect={target.anchorRect}
+          selection={target.selection}
+          before={target.before}
+          after={target.after}
+          filePath={path}
+          onAccept={acceptRevision}
+          onClose={closePopover}
+        />
+      )}
     </div>
   );
 }
@@ -1221,8 +1663,412 @@ function ImageAnnotator({
 }
 
 // ---------------------------------------------------------------------------
+// AnnData (.h5ad) structured-card viewer
+// ---------------------------------------------------------------------------
+
+interface AnnDataColumn {
+  name: string;
+  dtype: string;
+  n_unique?: number;
+  min?: number;
+  max?: number;
+  mean?: number;
+  categories?: (string | number | boolean | null)[];
+  top?: { value: string | number | boolean | null; count: number }[];
+  n_true?: number;
+  n_false?: number;
+  error?: string;
+}
+
+interface AnnDataLayer {
+  name: string;
+  shape?: number[];
+  dtype?: string;
+  sparse?: boolean;
+  error?: string;
+}
+
+interface AnnDataEmbedding {
+  key: string;
+  shape: number[];
+}
+
+interface AnnDataSummary {
+  n_obs: number;
+  n_vars: number;
+  X: { shape?: number[]; dtype?: string; sparse?: boolean; error?: string };
+  layers: AnnDataLayer[];
+  obs_columns: AnnDataColumn[];
+  var_columns: AnnDataColumn[];
+  obs_column_count: number;
+  var_column_count: number;
+  obsm_keys: string[];
+  varm_keys: string[];
+  uns_keys: string[];
+  obsp_keys: string[];
+  varp_keys: string[];
+  embeddings: AnnDataEmbedding[];
+  default_embedding: string | null;
+  file_size: number;
+  anndata_version: string;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatNum(n: number | undefined | null): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  if (Math.abs(n) >= 1000 || (Math.abs(n) > 0 && Math.abs(n) < 0.01)) {
+    return n.toExponential(2);
+  }
+  return n.toFixed(3).replace(/\.?0+$/, "") || "0";
+}
+
+function ColumnPreviewValue({ col }: { col: AnnDataColumn }) {
+  if (col.error) return <span className="text-red-500/80">{col.error}</span>;
+  if (col.dtype === "categorical" || col.top) {
+    const top = col.top ?? [];
+    if (top.length === 0) return <span className="text-muted-foreground/50">—</span>;
+    return (
+      <span className="truncate">
+        {top.map((t, i) => (
+          <span key={i}>
+            {i > 0 && <span className="text-muted-foreground/40"> · </span>}
+            <span className="text-foreground/80">{String(t.value)}</span>
+            <span className="text-muted-foreground/50"> ({t.count})</span>
+          </span>
+        ))}
+      </span>
+    );
+  }
+  if (col.dtype === "bool") {
+    return (
+      <span className="text-muted-foreground">
+        {col.n_true ?? 0} true · {col.n_false ?? 0} false
+      </span>
+    );
+  }
+  if (col.min !== undefined || col.max !== undefined) {
+    return (
+      <span className="text-muted-foreground">
+        min {formatNum(col.min)} · max {formatNum(col.max)} · mean {formatNum(col.mean)}
+      </span>
+    );
+  }
+  return <span className="text-muted-foreground/50">—</span>;
+}
+
+function ColumnTable({
+  title,
+  cols,
+  totalCount,
+}: {
+  title: string;
+  cols: AnnDataColumn[];
+  totalCount: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const showRows = expanded ? cols : cols.slice(0, 12);
+  const hidden = cols.length - showRows.length;
+
+  return (
+    <div className="overflow-hidden rounded-md border">
+      <div className="flex items-center gap-2 border-b bg-muted/30 px-3 py-1.5">
+        <span className="font-mono text-xs font-semibold">{title}</span>
+        <span className="text-[11px] text-muted-foreground">
+          {totalCount.toLocaleString()} column{totalCount !== 1 ? "s" : ""}
+          {totalCount > cols.length && (
+            <span className="text-muted-foreground/60"> · first {cols.length} shown</span>
+          )}
+        </span>
+      </div>
+      {cols.length === 0 ? (
+        <div className="px-3 py-3 text-xs text-muted-foreground/60">No columns</div>
+      ) : (
+        <table className="w-full border-collapse text-xs">
+          <thead>
+            <tr className="text-left">
+              <th className="border-b bg-muted/10 px-3 py-1 font-medium text-muted-foreground">name</th>
+              <th className="border-b bg-muted/10 px-3 py-1 font-medium text-muted-foreground">dtype</th>
+              <th className="border-b bg-muted/10 px-3 py-1 font-medium text-muted-foreground">n unique</th>
+              <th className="border-b bg-muted/10 px-3 py-1 font-medium text-muted-foreground">preview</th>
+            </tr>
+          </thead>
+          <tbody>
+            {showRows.map((col) => (
+              <tr key={col.name} className="border-b border-muted/40 last:border-b-0 hover:bg-muted/20">
+                <td className="max-w-[200px] truncate px-3 py-1 font-mono text-[11px] text-foreground/90" title={col.name}>
+                  {col.name}
+                </td>
+                <td className="px-3 py-1 font-mono text-[11px] text-muted-foreground whitespace-nowrap">{col.dtype}</td>
+                <td className="px-3 py-1 text-[11px] text-muted-foreground">
+                  {col.n_unique !== undefined ? col.n_unique.toLocaleString() : "—"}
+                </td>
+                <td className="max-w-[320px] truncate px-3 py-1 text-[11px]">
+                  <ColumnPreviewValue col={col} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {hidden > 0 && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="w-full border-t bg-muted/10 py-1.5 text-[11px] text-muted-foreground hover:bg-muted/30"
+        >
+          Show {hidden} more
+        </button>
+      )}
+    </div>
+  );
+}
+
+function KeyChips({ title, keys }: { title: string; keys: string[] }) {
+  if (keys.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-baseline gap-1.5 text-xs">
+      <span className="font-mono font-semibold text-foreground/80">{title}</span>
+      <span className="text-muted-foreground/60">·</span>
+      {keys.map((k) => (
+        <span
+          key={k}
+          className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground"
+        >
+          {k}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function AnnDataViewer({ path }: { path: string }) {
+  const [summary, setSummary] = useState<AnnDataSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [colorCol, setColorCol] = useState<string>("");
+  const [imgBust, setImgBust] = useState(0);
+
+  const fetchSummary = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(anndataSummaryUrl(path), { signal: controller.signal });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        let detail = `${res.status} ${res.statusText}`;
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed?.detail) detail = String(parsed.detail);
+        } catch {
+          if (body) detail = body;
+        }
+        setError(detail);
+      } else {
+        const data = (await res.json()) as AnnDataSummary;
+        setSummary(data);
+        setSelectedKey(data.default_embedding ?? data.embeddings[0]?.key ?? null);
+        setColorCol("");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load summary");
+    } finally {
+      clearTimeout(timeout);
+      setLoading(false);
+    }
+  }, [path]);
+
+  useEffect(() => {
+    fetchSummary();
+  }, [fetchSummary]);
+
+  // Re-fetch when the active path itself changes under us (e.g. rename)
+  useEffect(() => {
+    setImgBust((n) => n + 1);
+  }, [selectedKey, colorCol, path]);
+
+  if (loading) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3">
+        <div className="size-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground" />
+        <p className="text-xs text-muted-foreground">Reading .h5ad metadata…</p>
+      </div>
+    );
+  }
+
+  if (error || !summary) {
+    return <FileLoadError message={error ?? "Unknown error"} onRetry={fetchSummary} />;
+  }
+
+  const obsColumnNames = summary.obs_columns.map((c) => c.name);
+  const embeddingKeys = summary.embeddings.map((e) => e.key);
+  const activeKey = selectedKey ?? embeddingKeys[0] ?? null;
+
+  return (
+    <div className="h-full overflow-auto">
+      {/* Header */}
+      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-3 border-b bg-background/95 px-4 py-2 text-xs backdrop-blur">
+        <DatabaseIcon className="size-4 shrink-0 text-indigo-500" />
+        <span className="font-semibold">
+          {summary.n_obs.toLocaleString()} obs × {summary.n_vars.toLocaleString()} vars
+        </span>
+        <span className="text-muted-foreground">·</span>
+        <span className="text-muted-foreground">{formatBytes(summary.file_size)}</span>
+        {summary.X.dtype && (
+          <>
+            <span className="text-muted-foreground">·</span>
+            <span className="font-mono text-muted-foreground">X {summary.X.dtype}</span>
+            {summary.X.sparse && (
+              <span className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-indigo-700">
+                sparse
+              </span>
+            )}
+          </>
+        )}
+        <span className="ml-auto text-[10px] text-muted-foreground/60">
+          anndata {summary.anndata_version}
+        </span>
+      </div>
+
+      <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        {/* Left column: structured metadata */}
+        <div className="flex min-w-0 flex-col gap-4">
+          <ColumnTable
+            title="obs"
+            cols={summary.obs_columns}
+            totalCount={summary.obs_column_count}
+          />
+          <ColumnTable
+            title="var"
+            cols={summary.var_columns}
+            totalCount={summary.var_column_count}
+          />
+
+          {summary.layers.length > 0 && (
+            <div className="overflow-hidden rounded-md border">
+              <div className="border-b bg-muted/30 px-3 py-1.5">
+                <span className="font-mono text-xs font-semibold">layers</span>
+                <span className="ml-2 text-[11px] text-muted-foreground">
+                  {summary.layers.length} layer{summary.layers.length !== 1 ? "s" : ""}
+                </span>
+              </div>
+              <table className="w-full border-collapse text-xs">
+                <tbody>
+                  {summary.layers.map((layer) => (
+                    <tr key={layer.name} className="border-b border-muted/40 last:border-b-0">
+                      <td className="px-3 py-1 font-mono text-[11px] text-foreground/90">{layer.name}</td>
+                      <td className="px-3 py-1 font-mono text-[11px] text-muted-foreground">
+                        {layer.dtype ?? "—"}
+                      </td>
+                      <td className="px-3 py-1 font-mono text-[11px] text-muted-foreground">
+                        {layer.shape ? `${layer.shape[0]} × ${layer.shape[1]}` : "—"}
+                      </td>
+                      <td className="px-3 py-1 text-[11px]">
+                        {layer.sparse && (
+                          <span className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700">
+                            sparse
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <KeyChips title="obsm" keys={summary.obsm_keys} />
+            <KeyChips title="varm" keys={summary.varm_keys} />
+            <KeyChips title="uns" keys={summary.uns_keys} />
+            <KeyChips title="obsp" keys={summary.obsp_keys} />
+            <KeyChips title="varp" keys={summary.varp_keys} />
+          </div>
+        </div>
+
+        {/* Right column: embedding thumbnail */}
+        <div className="flex flex-col gap-2">
+          <div className="overflow-hidden rounded-md border">
+            <div className="flex items-center justify-between gap-2 border-b bg-muted/30 px-3 py-1.5">
+              <span className="font-mono text-xs font-semibold">embedding</span>
+              {embeddingKeys.length > 1 && activeKey && (
+                <select
+                  value={activeKey}
+                  onChange={(e) => setSelectedKey(e.target.value)}
+                  className="rounded border bg-background px-1.5 py-0.5 font-mono text-[11px] text-foreground"
+                >
+                  {embeddingKeys.map((k) => (
+                    <option key={k} value={k}>
+                      {k}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+            <div className="flex aspect-square items-center justify-center bg-muted/10 p-2">
+              {activeKey ? (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  key={`${activeKey}:${colorCol}:${imgBust}`}
+                  src={anndataEmbeddingUrl(path, activeKey, colorCol || null)}
+                  alt={`${activeKey} embedding`}
+                  className="h-full w-full object-contain"
+                />
+              ) : (
+                <div className="flex flex-col items-center gap-2 text-center text-xs text-muted-foreground">
+                  <DatabaseIcon className="size-6 text-muted-foreground/40" />
+                  No 2D embedding in obsm
+                </div>
+              )}
+            </div>
+          </div>
+
+          {activeKey && obsColumnNames.length > 0 && (
+            <label className="flex items-center gap-2 text-[11px]">
+              <span className="text-muted-foreground">color by</span>
+              <select
+                value={colorCol}
+                onChange={(e) => setColorCol(e.target.value)}
+                className="flex-1 rounded border bg-background px-1.5 py-0.5 font-mono text-[11px]"
+              >
+                <option value="">none</option>
+                {obsColumnNames.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          {activeKey && (
+            <p className="text-[10px] text-muted-foreground/70">
+              Showing first 2 dims of obsm[{activeKey}]. Points are downsampled to 20k for rendering.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // FilePreviewPanel (exported)
 // ---------------------------------------------------------------------------
+
+export interface RevealTarget {
+  path: string;
+  line?: number;
+  cell?: number;
+  token: number;
+}
 
 export interface FilePreviewPanelProps {
   tabs: Tab[];
@@ -1234,6 +2080,7 @@ export interface FilePreviewPanelProps {
   onSaveImageBlob: (path: string, blob: Blob) => Promise<boolean>;
   onRetry?: (path: string) => void;
   onCompileLatex?: (path: string, engine?: string) => Promise<LatexCompileResult>;
+  revealTarget?: RevealTarget | null;
 }
 
 export function FilePreviewPanel({
@@ -1246,6 +2093,7 @@ export function FilePreviewPanel({
   onSaveImageBlob,
   onRetry,
   onCompileLatex,
+  revealTarget,
 }: FilePreviewPanelProps) {
   // Per-tab mode tracking
   const [tabModes, setTabModes] = useState<Record<string, PanelMode>>({});
@@ -1263,8 +2111,9 @@ export function FilePreviewPanel({
 
   const selectedName = selectedPath?.split("/").pop() ?? null;
   const cat = selectedName ? fileCategory(selectedName) : "text";
-  // All text-based formats can be edited as source
-  const canEdit = cat !== "image" && cat !== "pdf";
+  // All text-based formats can be edited as source. Binary/structured
+  // viewers (images, PDFs, anndata) have no raw-text editor.
+  const canEdit = cat !== "image" && cat !== "pdf" && cat !== "anndata";
   const canAnnotate = cat === "image";
 
   const header = selectedPath && (
@@ -1353,6 +2202,7 @@ export function FilePreviewPanel({
           <div className="flex-1 min-h-0">
             <TextEditor
               key={selectedPath}
+              path={selectedPath}
               name={selectedName ?? ""}
               initialContent={fileContent ?? ""}
               onSave={(content) => onSaveText(selectedPath, content)}
@@ -1383,7 +2233,7 @@ export function FilePreviewPanel({
           <div className={cn(
             "flex-1 min-h-0",
             // These viewers manage their own scroll internally
-            cat === "pdf" || cat === "notebook" || cat === "fasta" || cat === "biotable"
+            cat === "pdf" || cat === "notebook" || cat === "fasta" || cat === "biotable" || cat === "anndata"
               ? ""
               : "overflow-auto bg-muted/10"
           )}>
@@ -1393,6 +2243,22 @@ export function FilePreviewPanel({
               content={fileContent}
               loading={loadingFile}
               onRetry={onRetry ? () => onRetry(selectedPath) : undefined}
+              onSave={(content) => onSaveText(selectedPath, content)}
+              revealLine={
+                revealTarget && revealTarget.path === selectedPath
+                  ? revealTarget.line
+                  : undefined
+              }
+              revealCell={
+                revealTarget && revealTarget.path === selectedPath
+                  ? revealTarget.cell
+                  : undefined
+              }
+              revealToken={
+                revealTarget && revealTarget.path === selectedPath
+                  ? revealTarget.token
+                  : undefined
+              }
             />
           </div>
         </>

@@ -34,13 +34,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .claims import build_turn_claims_doc, summarize_claims
 from .gemini_settings import build_default_settings, load_custom_mcps
+from .projects import active_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SANDBOX_ROOT = (REPO_ROOT / "sandbox").resolve()
-KADY_DIR = SANDBOX_ROOT / ".kady"
-RUNS_DIR = KADY_DIR / "runs"
-SESSIONS_DIR = KADY_DIR / "sessions"
+
+
+def _paths():
+    """Return the active project's ProjectPaths — one place all manifest I/O routes through."""
+    return active_paths()
 
 _locks: dict[str, asyncio.Lock] = {}
 
@@ -66,7 +69,7 @@ def ulid() -> str:
 
 def session_seed(session_id: str) -> str:
     """Return the 16-byte hex seed for a session, creating it on first use."""
-    seed_path = SESSIONS_DIR / session_id / "seed"
+    seed_path = _paths().sessions_dir / session_id / "seed"
     if seed_path.is_file():
         try:
             value = seed_path.read_text(encoding="utf-8").strip()
@@ -215,8 +218,10 @@ async def open_turn(
     so replay can rehydrate exactly the bytes the user supplied without
     depending on the mutable sandbox tree.
     """
+    paths = _paths()
+    sandbox_root = paths.sandbox
     turn_id = ulid()
-    turn_dir = RUNS_DIR / session_id / turn_id
+    turn_dir = paths.runs_dir / session_id / turn_id
     turn_dir.mkdir(parents=True, exist_ok=True)
     attachments_dir = turn_dir / "attachments"
 
@@ -224,9 +229,9 @@ async def open_turn(
     for rel in attachments:
         if not rel:
             continue
-        src = (SANDBOX_ROOT / rel).resolve()
+        src = (sandbox_root / rel).resolve()
         try:
-            src.relative_to(SANDBOX_ROOT)
+            src.relative_to(sandbox_root)
         except ValueError:
             continue
         if not src.is_file():
@@ -293,7 +298,7 @@ async def open_turn(
 
 
 def manifest_path(session_id: str, turn_id: str) -> Path:
-    return RUNS_DIR / session_id / turn_id / "manifest.json"
+    return _paths().runs_dir / session_id / turn_id / "manifest.json"
 
 
 def read_manifest(session_id: str, turn_id: str) -> dict | None:
@@ -312,11 +317,13 @@ async def attach_delegation(
     stdout: str | None = None,
     env_lock: str | None = None,
     deliverables: list[str] | None = None,
+    claims: list[dict] | None = None,
+    produced_code: bool = False,
 ) -> None:
     """Append a delegation record to the manifest and persist side files."""
     lock = _manifest_lock(turn_id)
     async with lock:
-        turn_dir = RUNS_DIR / session_id / turn_id
+        turn_dir = _paths().runs_dir / session_id / turn_id
         expert_dir = turn_dir / "expert" / delegation_id
         expert_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -348,6 +355,31 @@ async def attach_delegation(
             except OSError:
                 pass
 
+        claims_count: int | None = None
+        claims_path_rel: str | None = None
+        if claims:
+            claims_count = len(claims)
+            try:
+                (expert_dir / "claims.json").write_text(
+                    json.dumps(claims, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                claims_path_rel = f"expert/{delegation_id}/claims.json"
+            except OSError:
+                pass
+
+            # Merge this delegation's claims into the turn-level claims.json
+            # so GET /turns/{s}/{t}/claims returns a single concatenated list.
+            turn_claims_path = turn_dir / "claims.json"
+            existing_doc = _read_json(turn_claims_path) or {}
+            existing_claims = existing_doc.get("claims") if isinstance(existing_doc, dict) else None
+            base: list[dict] = list(existing_claims) if isinstance(existing_claims, list) else []
+            base.extend(claims)
+            _write_json(
+                turn_claims_path,
+                build_turn_claims_doc(turn_id=turn_id, entries=base),
+            )
+
         manifest = _read_json(turn_dir / "manifest.json") or {}
         manifest.setdefault("delegations", []).append(
             {
@@ -360,8 +392,27 @@ async def attach_delegation(
                 "envLockPath": env_lock_path,
                 "deliverables": deliverables_list,
                 "promptDir": f"expert/{delegation_id}",
+                "producedCode": bool(produced_code),
+                "claimsCount": claims_count,
+                "claimsPath": claims_path_rel,
             }
         )
+
+        # Recompute the turn-level claims summary + producedCode flag so the
+        # frontend can auto-trigger on the cheap manifest endpoint.
+        turn_claims_doc = _read_json(turn_dir / "claims.json") or {}
+        turn_claims_list = (
+            turn_claims_doc.get("claims") if isinstance(turn_claims_doc, dict) else None
+        )
+        if isinstance(turn_claims_list, list) and turn_claims_list:
+            summary = summarize_claims(turn_claims_list)
+        else:
+            summary = {"total": 0, "verified": 0, "approximate": 0, "unbacked": 0, "ambiguous": 0}
+        summary["producedCode"] = any(
+            bool(d.get("producedCode")) for d in manifest.get("delegations", [])
+        )
+        manifest["claims"] = summary
+
         _write_json(turn_dir / "manifest.json", manifest)
 
 
@@ -404,11 +455,12 @@ async def close_turn(
 def _enumerate_deliverables(started_at: float) -> list[str]:
     """List sandbox files modified after the turn started, excluding .kady/."""
     out: list[str] = []
-    if not SANDBOX_ROOT.is_dir():
+    sandbox_root = _paths().sandbox
+    if not sandbox_root.is_dir():
         return out
-    for path in SANDBOX_ROOT.rglob("*"):
+    for path in sandbox_root.rglob("*"):
         try:
-            rel = path.relative_to(SANDBOX_ROOT)
+            rel = path.relative_to(sandbox_root)
         except ValueError:
             continue
         if rel.parts and rel.parts[0].startswith("."):
@@ -443,7 +495,7 @@ def update_manifest(
 
 
 def list_turns(session_id: str) -> list[str]:
-    session_dir = RUNS_DIR / session_id
+    session_dir = _paths().runs_dir / session_id
     if not session_dir.is_dir():
         return []
     return sorted(p.name for p in session_dir.iterdir() if p.is_dir())

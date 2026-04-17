@@ -2,6 +2,32 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
+/* pdfjs text layer styling. We keep glyphs transparent so the canvas
+   shows through, but allow the native selection to highlight the
+   invisible text — this is what lets the user select text to highlight
+   passages in our PDF viewer. */
+.pdf-text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  opacity: 1;
+  line-height: 1;
+  text-align: initial;
+  pointer-events: auto;
+  user-select: text;
+}
+.pdf-text-layer > span,
+.pdf-text-layer > br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+.pdf-text-layer ::selection {
+  background: rgba(59, 130, 246, 0.35);
+}
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {

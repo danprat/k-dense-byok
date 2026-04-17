@@ -8,11 +8,12 @@ from typing import Optional
 from dotenv import load_dotenv
 from google.adk.tools.tool_context import ToolContext
 
+from ..claims import load_expert_claims, produced_code
 from ..manifest import (
-    RUNS_DIR,
     attach_delegation,
     session_seed,
 )
+from ..projects import active_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -103,7 +104,7 @@ def _collect_expert_artifacts(kady_dir: Path, delegation_id: str) -> tuple[str |
 
 async def delegate_task(
     prompt: str,
-    working_directory: str = "sandbox",
+    working_directory: Optional[str] = None,
     tool_context: Optional[ToolContext] = None,
 ) -> dict:
     """Delegate a task to an expert.
@@ -111,6 +112,7 @@ async def delegate_task(
     Args:
         prompt: The prompt to delegate to the expert.
         working_directory: The sandbox directory to execute the task in.
+            Defaults to the active project's sandbox.
 
     Returns:
         A dict with ``result`` (response text), ``skills_used`` (list of
@@ -128,9 +130,13 @@ async def delegate_task(
         else _CLI_OPENROUTER_HEADERS
     )
 
-    cwd = Path(working_directory)
-    if not cwd.is_absolute():
-        cwd = REPO_ROOT / cwd
+    paths = active_paths()
+    if working_directory is None:
+        cwd = paths.sandbox
+    else:
+        cwd = Path(working_directory)
+        if not cwd.is_absolute():
+            cwd = REPO_ROOT / cwd
 
     cwd.mkdir(parents=True, exist_ok=True)
 
@@ -141,9 +147,13 @@ async def delegate_task(
     turn_id: Optional[str] = None
     session_id: Optional[str] = None
     delegation_id: Optional[str] = None
+    selected_model: Optional[str] = None
     if state is not None:
         turn_id = state.get("_turnId")
         session_id = state.get("_sessionId")
+        raw_model = state.get("_model")
+        if isinstance(raw_model, str) and raw_model.strip():
+            selected_model = raw_model.strip()
     if session_id and turn_id:
         env["KADY_SEED"] = session_seed(session_id)
         env["KADY_TURN_ID"] = turn_id
@@ -154,6 +164,15 @@ async def delegate_task(
         delegation_id = f"{int(prev) + 1:03d}"
         state[counter_key] = int(prev) + 1
         env["KADY_DELEGATION_ID"] = delegation_id
+
+    # Propagate the active project to expert-side MCP servers (e.g. the
+    # pdf-annotations server needs to resolve the right sandbox), and
+    # stamp an author label the PDF viewer renders next to any
+    # annotations the expert emits.
+    env["KADY_PROJECT_ID"] = paths.id
+    if delegation_id:
+        env.setdefault("KADY_EXPERT_ID", delegation_id)
+        env.setdefault("KADY_EXPERT_LABEL", f"Expert #{delegation_id}")
 
     sandbox_venv = cwd / ".venv"
     if sandbox_venv.is_dir():
@@ -166,14 +185,19 @@ async def delegate_task(
             path_parts = [p for p in path_parts if p != old_bin]
         env["PATH"] = os.pathsep.join([venv_bin] + path_parts)
 
+    # Forward the orchestrator-selected model to the expert so local Ollama
+    # (or any other LiteLLM-registered) model is used end-to-end. The CLI
+    # still talks to the same LiteLLM proxy (GOOGLE_GEMINI_BASE_URL); the
+    # proxy's `ollama/*` wildcard and existing OpenRouter entries handle
+    # the actual upstream dispatch.
+    cli_args: list[str] = ["gemini", "-p", prompt, "--yolo",
+                           "--output-format", "stream-json"]
+    if selected_model:
+        cli_args.extend(["-m", selected_model])
+
     started_at = time.time()
     proc = await asyncio.create_subprocess_exec(
-        "gemini",
-        "-p",
-        prompt,
-        "--yolo",
-        "--output-format",
-        "stream-json",
+        *cli_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
@@ -194,13 +218,19 @@ async def delegate_task(
     if session_id and turn_id and delegation_id:
         env_lock: str | None = None
         deliverables: list[str] | None = None
+        claim_entries: list[dict] = []
         kady_dir = cwd / ".kady"
         if kady_dir.is_dir():
             env_lock, deliverables = _collect_expert_artifacts(kady_dir, delegation_id)
+            claim_entries = load_expert_claims(
+                kady_dir / "expert" / delegation_id / "claims.json",
+                delegation_id=delegation_id,
+            )
+        did_produce_code = produced_code(result, env_lock)
         try:
             # Also mirror the delegation dir into the run-level manifest tree so
             # the expert's stdout is reachable by turnId (not just by cwd).
-            target_expert_dir = RUNS_DIR / session_id / turn_id / "expert" / delegation_id
+            target_expert_dir = paths.runs_dir / session_id / turn_id / "expert" / delegation_id
             target_expert_dir.mkdir(parents=True, exist_ok=True)
             await attach_delegation(
                 session_id=session_id,
@@ -213,6 +243,8 @@ async def delegate_task(
                 stdout=raw,
                 env_lock=env_lock,
                 deliverables=deliverables,
+                claims=claim_entries,
+                produced_code=did_produce_code,
             )
         except Exception:
             pass

@@ -1,3 +1,4 @@
+import { apiFetch } from "@/lib/projects";
 import type { ChatMessage } from "@/lib/use-agent";
 
 export interface TurnMeta {
@@ -182,11 +183,6 @@ export interface RunManifest {
   manifestSha256?: string;
 }
 
-const API_BASE =
-  typeof process !== "undefined"
-    ? process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000"
-    : "http://localhost:8000";
-
 export async function fetchManifests(
   sessionId: string,
   turnIds: string[]
@@ -195,8 +191,8 @@ export async function fetchManifests(
   const results = await Promise.all(
     turnIds.map(async (turnId) => {
       try {
-        const resp = await fetch(
-          `${API_BASE}/turns/${sessionId}/${turnId}/manifest`
+        const resp = await apiFetch(
+          `/turns/${sessionId}/${turnId}/manifest`
         );
         if (!resp.ok) return null;
         return (await resp.json()) as RunManifest;

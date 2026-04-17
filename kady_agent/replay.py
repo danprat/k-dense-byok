@@ -21,16 +21,21 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .manifest import (
-    RUNS_DIR,
-    SANDBOX_ROOT,
     _write_json,
     manifest_path,
     read_manifest,
     ulid,
 )
+from .projects import active_paths
 from .tools.gemini_cli import delegate_task
 
-REPLAYS_DIR = SANDBOX_ROOT / ".kady" / "replays"
+
+def _replays_dir() -> Path:
+    return active_paths().kady_dir / "replays"
+
+
+def _runs_dir() -> Path:
+    return active_paths().runs_dir
 
 
 def _rehydrate_attachments(
@@ -45,7 +50,7 @@ def _rehydrate_attachments(
     restored: list[str] = []
     session_id = manifest["sessionId"]
     turn_id = manifest["turnId"]
-    original_turn_dir = RUNS_DIR / session_id / turn_id
+    original_turn_dir = _runs_dir() / session_id / turn_id
     for att in manifest.get("input", {}).get("attachments", []):
         sha = att.get("sha256")
         rel = att.get("path")
@@ -84,8 +89,9 @@ async def replay_turn(
         yield {"event": "replay_error", "detail": f"manifest not found: {turn_id}"}
         return
 
+    replays_dir = _replays_dir()
     new_turn_id = ulid()
-    replay_sandbox = REPLAYS_DIR / replay_id / new_turn_id
+    replay_sandbox = replays_dir / replay_id / new_turn_id
     replay_sandbox.mkdir(parents=True, exist_ok=True)
 
     restored = _rehydrate_attachments(
@@ -116,7 +122,7 @@ async def replay_turn(
         "startedAt": time.time(),
     }
 
-    replay_turn_dir = REPLAYS_DIR / replay_id / "runs" / new_turn_id
+    replay_turn_dir = replays_dir / replay_id / "runs" / new_turn_id
     replay_turn_dir.mkdir(parents=True, exist_ok=True)
     _write_json(replay_turn_dir / "manifest.json", new_manifest)
 

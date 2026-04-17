@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_ADK_API_URL ?? "http://localhost:8000";
+import { API_BASE, apiFetch, getActiveProjectId, onProjectChange } from "@/lib/projects";
 
 export interface TreeNode {
   name: string;
@@ -21,6 +21,7 @@ export type FileCategory =
   | "fasta"
   | "biotable"
   | "latex"
+  | "anndata"
   | "text";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "tiff", "heic"]);
@@ -32,7 +33,10 @@ const BIOTABLE_EXTS = new Set(["vcf", "bed", "gff", "gtf", "gff3", "sam", "tsv",
 const LATEX_EXTS = new Set(["tex", "latex"]);
 
 export function fileCategory(name: string): FileCategory {
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const lower = name.toLowerCase();
+  // Handle compound extensions like .h5ad.gz before the generic split
+  if (lower.endsWith(".h5ad") || lower.endsWith(".h5ad.gz")) return "anndata";
+  const ext = lower.split(".").pop() ?? "";
   if (IMAGE_EXTS.has(ext)) return "image";
   if (ext === "pdf") return "pdf";
   if (ext === "md" || ext === "mdx") return "markdown";
@@ -45,7 +49,27 @@ export function fileCategory(name: string): FileCategory {
 }
 
 export function rawFileUrl(path: string): string {
-  return `${API_BASE}/sandbox/raw?path=${encodeURIComponent(path)}`;
+  const project = encodeURIComponent(getActiveProjectId());
+  return `${API_BASE}/sandbox/raw?path=${encodeURIComponent(path)}&project=${project}`;
+}
+
+export function anndataSummaryUrl(path: string): string {
+  const project = encodeURIComponent(getActiveProjectId());
+  return `${API_BASE}/sandbox/anndata-summary?path=${encodeURIComponent(path)}&project=${project}`;
+}
+
+export function anndataEmbeddingUrl(
+  path: string,
+  key: string,
+  color?: string | null,
+): string {
+  const params = new URLSearchParams({
+    path,
+    key,
+    project: getActiveProjectId(),
+  });
+  if (color) params.set("color", color);
+  return `${API_BASE}/sandbox/anndata-embedding.png?${params.toString()}`;
 }
 
 export interface Tab {
@@ -77,7 +101,7 @@ export function useSandbox(isActive = false) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
     try {
-      const res = await fetch(`${API_BASE}/sandbox/tree`, {
+      const res = await apiFetch(`/sandbox/tree`, {
         signal: controller.signal,
       });
       if (!res.ok) return;
@@ -110,8 +134,8 @@ export function useSandbox(isActive = false) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
     try {
-      const res = await fetch(
-        `${API_BASE}/sandbox/file?path=${encodeURIComponent(path)}`,
+      const res = await apiFetch(
+        `/sandbox/file?path=${encodeURIComponent(path)}`,
         { signal: controller.signal },
       );
       const content = res.ok
@@ -155,7 +179,7 @@ export function useSandbox(isActive = false) {
     const name = path.split("/").pop() ?? "";
     const cat = fileCategory(name);
 
-    if (cat === "image" || cat === "pdf") {
+    if (cat === "image" || cat === "pdf" || cat === "anndata") {
       setTabs((prev) => {
         const next = prev.map((t) => (t.path === path ? { ...t, loading: false } : t));
         tabsRef.current = next;
@@ -193,7 +217,7 @@ export function useSandbox(isActive = false) {
             paths?.[i] || (arr[i] as File & { webkitRelativePath?: string }).webkitRelativePath || "",
           );
         }
-        const res = await fetch(`${API_BASE}/sandbox/upload`, { method: "POST", body });
+        const res = await apiFetch(`/sandbox/upload`, { method: "POST", body });
         if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
         const data = await res.json();
         await fetchTree();
@@ -209,8 +233,8 @@ export function useSandbox(isActive = false) {
 
   const saveFile = useCallback(async (path: string, content: string): Promise<boolean> => {
     try {
-      const res = await fetch(
-        `${API_BASE}/sandbox/file?path=${encodeURIComponent(path)}`,
+      const res = await apiFetch(
+        `/sandbox/file?path=${encodeURIComponent(path)}`,
         { method: "PUT", body: content, headers: { "Content-Type": "text/plain; charset=utf-8" } }
       );
       if (res.ok) {
@@ -228,8 +252,8 @@ export function useSandbox(isActive = false) {
 
   const saveImageBlob = useCallback(async (path: string, blob: Blob): Promise<boolean> => {
     try {
-      const res = await fetch(
-        `${API_BASE}/sandbox/file?path=${encodeURIComponent(path)}`,
+      const res = await apiFetch(
+        `/sandbox/file?path=${encodeURIComponent(path)}`,
         { method: "PUT", body: blob }
       );
       return res.ok;
@@ -241,8 +265,8 @@ export function useSandbox(isActive = false) {
   const deleteFile = useCallback(
     async (path: string) => {
       try {
-        const res = await fetch(
-          `${API_BASE}/sandbox/file?path=${encodeURIComponent(path)}`,
+        const res = await apiFetch(
+          `/sandbox/file?path=${encodeURIComponent(path)}`,
           { method: "DELETE" }
         );
         if (!res.ok) return;
@@ -258,8 +282,8 @@ export function useSandbox(isActive = false) {
   const deleteDir = useCallback(
     async (path: string) => {
       try {
-        const res = await fetch(
-          `${API_BASE}/sandbox/directory?path=${encodeURIComponent(path)}`,
+        const res = await apiFetch(
+          `/sandbox/directory?path=${encodeURIComponent(path)}`,
           { method: "DELETE" }
         );
         if (!res.ok) return;
@@ -277,8 +301,9 @@ export function useSandbox(isActive = false) {
   );
 
   const downloadDir = useCallback((path: string) => {
+    const project = encodeURIComponent(getActiveProjectId());
     const a = document.createElement("a");
-    a.href = `${API_BASE}/sandbox/download-dir?path=${encodeURIComponent(path)}`;
+    a.href = `${API_BASE}/sandbox/download-dir?path=${encodeURIComponent(path)}&project=${project}`;
     a.download = "";
     document.body.appendChild(a);
     a.click();
@@ -286,8 +311,9 @@ export function useSandbox(isActive = false) {
   }, []);
 
   const downloadFile = useCallback((path: string) => {
+    const project = encodeURIComponent(getActiveProjectId());
     const a = document.createElement("a");
-    a.href = `${API_BASE}/sandbox/download?path=${encodeURIComponent(path)}`;
+    a.href = `${API_BASE}/sandbox/download?path=${encodeURIComponent(path)}&project=${project}`;
     a.download = "";
     document.body.appendChild(a);
     a.click();
@@ -295,8 +321,9 @@ export function useSandbox(isActive = false) {
   }, []);
 
   const downloadAll = useCallback(() => {
+    const project = encodeURIComponent(getActiveProjectId());
     const a = document.createElement("a");
-    a.href = `${API_BASE}/sandbox/download-all`;
+    a.href = `${API_BASE}/sandbox/download-all?project=${project}`;
     a.download = "sandbox.zip";
     document.body.appendChild(a);
     a.click();
@@ -306,7 +333,7 @@ export function useSandbox(isActive = false) {
   const moveItem = useCallback(
     async (src: string, dest: string): Promise<boolean> => {
       try {
-        const res = await fetch(`${API_BASE}/sandbox/move`, {
+        const res = await apiFetch(`/sandbox/move`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ src, dest }),
@@ -355,7 +382,7 @@ export function useSandbox(isActive = false) {
   const createDir = useCallback(
     async (path: string): Promise<boolean> => {
       try {
-        const res = await fetch(`${API_BASE}/sandbox/mkdir`, {
+        const res = await apiFetch(`/sandbox/mkdir`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
@@ -373,7 +400,7 @@ export function useSandbox(isActive = false) {
   const compileLatex = useCallback(
     async (path: string, engine = "pdflatex"): Promise<LatexCompileResult> => {
       try {
-        const res = await fetch(`${API_BASE}/sandbox/compile-latex`, {
+        const res = await apiFetch(`/sandbox/compile-latex`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path, engine }),
@@ -396,12 +423,12 @@ export function useSandbox(isActive = false) {
     for (const tab of current) {
       const name = tab.path.split("/").pop() ?? "";
       const cat = fileCategory(name);
-      if (cat === "image" || cat === "pdf") continue;
+      if (cat === "image" || cat === "pdf" || cat === "anndata") continue;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
       try {
-        const res = await fetch(
-          `${API_BASE}/sandbox/file?path=${encodeURIComponent(tab.path)}`,
+        const res = await apiFetch(
+          `/sandbox/file?path=${encodeURIComponent(tab.path)}`,
           { signal: controller.signal },
         );
         const content = res.ok
@@ -443,6 +470,19 @@ export function useSandbox(isActive = false) {
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [fetchTree]);
+
+  useEffect(
+    () =>
+      onProjectChange(() => {
+        openPathsRef.current = new Set();
+        tabsRef.current = [];
+        setTabs([]);
+        setActiveTabPath(null);
+        setTree(null);
+        void fetchTree();
+      }),
+    [fetchTree]
+  );
 
   return {
     tree,

@@ -6,42 +6,141 @@ import os
 import re
 import shutil
 import zipfile
+from datetime import datetime, timezone
+from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
+from typing import Optional
 
+import httpx
 import yaml
-from fastapi import Body, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from google.adk.cli.fast_api import get_fast_api_app
 
+from google.adk.auth.credential_service.in_memory_credential_service import (
+    InMemoryCredentialService,
+)
+from google.adk.cli.adk_web_server import AdkWebServer
+from google.adk.cli.utils.agent_loader import AgentLoader
+from google.adk.cli.utils.service_factory import (
+    create_artifact_service_from_options,
+    create_memory_service_from_options,
+)
+from google.adk.evaluation.local_eval_set_results_manager import (
+    LocalEvalSetResultsManager,
+)
+from google.adk.evaluation.local_eval_sets_manager import LocalEvalSetsManager
+
+from kady_agent.anndata_preview import (
+    AnnDataDepsMissing,
+    render_embedding_png,
+    summarize_h5ad,
+)
+from kady_agent.citations import report_to_dict, verify_text_and_files
 from kady_agent.gemini_settings import (
     load_custom_mcps,
     save_custom_mcps,
     write_merged_settings,
 )
-from kady_agent.citations import report_to_dict, verify_text_and_files
 from kady_agent.manifest import (
-    RUNS_DIR,
     list_turns,
     read_manifest,
     update_manifest,
 )
+from kady_agent.project_session_service import ProjectSessionService
+from kady_agent.projects import (
+    ACTIVE_PROJECT,
+    DEFAULT_PROJECT_ID,
+    active_paths,
+    ensure_project_exists,
+    touch_project,
+)
+from kady_agent.projects_api import projects_router
 from kady_agent.replay import replay_session
 
-app = get_fast_api_app(
-    agents_dir=".",
-    web=False,
-    allow_origins=["http://localhost:3000"],
+
+# ---------------------------------------------------------------------------
+# ADK app: construct AdkWebServer ourselves so we can install our
+# project-scoped session service. Functionally equivalent to
+# `get_fast_api_app(agents_dir=".", web=False, ...)` but with the session
+# service swapped in from the start.
+# ---------------------------------------------------------------------------
+
+_AGENTS_DIR = "."
+_agent_loader = AgentLoader(_AGENTS_DIR)
+_eval_sets_manager = LocalEvalSetsManager(agents_dir=_AGENTS_DIR)
+_eval_set_results_manager = LocalEvalSetResultsManager(agents_dir=_AGENTS_DIR)
+
+_memory_service = create_memory_service_from_options(
+    base_dir=_AGENTS_DIR,
+    memory_service_uri=None,
+)
+_session_service = ProjectSessionService()
+_artifact_service = create_artifact_service_from_options(
+    base_dir=_AGENTS_DIR,
+    artifact_service_uri=None,
+    strict_uri=True,
+    use_local_storage=True,
+)
+_credential_service = InMemoryCredentialService()
+
+_adk_web_server = AdkWebServer(
+    agent_loader=_agent_loader,
+    session_service=_session_service,
+    memory_service=_memory_service,
+    artifact_service=_artifact_service,
+    credential_service=_credential_service,
+    eval_sets_manager=_eval_sets_manager,
+    eval_set_results_manager=_eval_set_results_manager,
+    agents_dir=_AGENTS_DIR,
+    extra_plugins=None,
     auto_create_session=True,
 )
 
-SANDBOX_ROOT = Path("sandbox").resolve()
+app = _adk_web_server.get_fast_api_app(
+    allow_origins=["http://localhost:3000"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Project scope: read `X-Project-Id` on every request and set the
+# ACTIVE_PROJECT ContextVar. All downstream path resolution routes through
+# active_paths() so the same request handler serves the right project.
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def project_scope(request: Request, call_next):
+    # Prefer the explicit header (set by apiFetch); fall back to the
+    # "kady-project" cookie so plain <img>/<a> URLs (where custom headers
+    # can't be set) still land in the right project.
+    raw = request.headers.get("x-project-id")
+    if not (raw and raw.strip()):
+        raw = request.query_params.get("project")
+    if not (raw and raw.strip()):
+        raw = request.cookies.get("kady-project")
+    project_id = raw.strip() if raw and raw.strip() else DEFAULT_PROJECT_ID
+    try:
+        ensure_project_exists(project_id)
+    except ValueError:
+        project_id = DEFAULT_PROJECT_ID
+        ensure_project_exists(project_id)
+    token = ACTIVE_PROJECT.set(project_id)
+    try:
+        return await call_next(request)
+    finally:
+        ACTIVE_PROJECT.reset(token)
+
+
+app.include_router(projects_router)
+
 
 _ZIP_EXCLUDED_NAMES = {"GEMINI.md", "uv.lock"}
 
 
 def _safe_path(rel: str) -> Path:
-    target = (SANDBOX_ROOT / rel).resolve()
-    if not target.is_relative_to(SANDBOX_ROOT):
+    sandbox_root = active_paths().sandbox
+    target = (sandbox_root / rel).resolve()
+    if not target.is_relative_to(sandbox_root):
         raise HTTPException(status_code=403, detail="Path traversal denied")
     return target
 
@@ -61,9 +160,85 @@ async def config():
     }
 
 
+def _format_ollama_bytes(n: int) -> str:
+    """Compact GB/MB rendering for Ollama blob sizes."""
+    if not isinstance(n, (int, float)) or n <= 0:
+        return ""
+    gb = n / 1_073_741_824
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = n / 1_048_576
+    return f"{mb:.0f} MB"
+
+
+def _ollama_entry(tag: dict) -> dict:
+    """Map an `/api/tags` entry to the Model shape consumed by the UI.
+
+    Ollama's tag payload looks like::
+
+        {"name": "llama3.2:3b", "size": 2000000000,
+         "details": {"family": "llama", "parameter_size": "3B",
+                     "quantization_level": "Q4_K_M"}}
+
+    We mirror the OpenRouter-derived entries in web/src/data/models.json so
+    the frontend can merge them into the same dropdown without special
+    casing individual fields.
+    """
+    name = tag.get("name") or tag.get("model") or ""
+    details = tag.get("details") or {}
+    family = details.get("family") or ""
+    param_size = details.get("parameter_size") or ""
+    quant = details.get("quantization_level") or ""
+    size_str = _format_ollama_bytes(int(tag.get("size") or 0))
+
+    bits = [b for b in (family, param_size, quant, size_str) if b]
+    description = (
+        "Local model served by Ollama at OLLAMA_BASE_URL. "
+        + (" · ".join(bits) if bits else "")
+    ).strip()
+
+    return {
+        "id": f"ollama/{name}" if name else "ollama/unknown",
+        "label": name or "unknown",
+        "provider": "Ollama",
+        "tier": "budget",
+        "context_length": 0,
+        "pricing": {"prompt": 0.0, "completion": 0.0},
+        "modality": "text->text",
+        "description": description,
+    }
+
+
+@app.get("/ollama/models")
+async def list_ollama_models():
+    """Proxy to ``GET {OLLAMA_BASE_URL}/api/tags`` and map into the UI's
+    Model shape.
+
+    Returns ``{available, models}`` so the frontend can distinguish
+    "Ollama not installed / not running" (available=false, empty list)
+    from "Ollama is running but no models pulled" (available=true, empty
+    list). Failures are swallowed so the dropdown just omits the local
+    section instead of erroring.
+    """
+    base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{base}/api/tags")
+        resp.raise_for_status()
+    except Exception:
+        return {"available": False, "models": []}
+    try:
+        data = resp.json() or {}
+    except ValueError:
+        return {"available": False, "models": []}
+    tags = data.get("models") or []
+    entries = [_ollama_entry(t) for t in tags if isinstance(t, dict)]
+    return {"available": True, "models": entries}
+
+
 @app.get("/settings/mcps")
 def get_custom_mcps():
-    """Return the user's custom MCP server definitions."""
+    """Return the active project's custom MCP server definitions."""
     return load_custom_mcps()
 
 
@@ -77,8 +252,8 @@ async def put_custom_mcps(request: Request):
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object")
     save_custom_mcps(data)
-    settings_dir = SANDBOX_ROOT / ".gemini"
-    write_merged_settings(settings_dir)
+    write_merged_settings(active_paths().gemini_settings_dir)
+    touch_project(ACTIVE_PROJECT.get())
     return {"ok": True}
 
 
@@ -129,11 +304,19 @@ async def replay_turns_endpoint(request: Request):
     ):
         raise HTTPException(status_code=400, detail="turnIds must be a list of strings")
 
+    # Capture the active project so the replay runs in the same project
+    # context even though the generator executes outside the request scope.
+    project_id = ACTIVE_PROJECT.get()
+
     async def stream():
-        async for event in replay_session(
-            session_id=session_id, turn_ids=turn_ids
-        ):
-            yield json.dumps(event) + "\n"
+        token = ACTIVE_PROJECT.set(project_id)
+        try:
+            async for event in replay_session(
+                session_id=session_id, turn_ids=turn_ids
+            ):
+                yield json.dumps(event) + "\n"
+        finally:
+            ACTIVE_PROJECT.reset(token)
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -147,11 +330,10 @@ async def get_turn_claims(session_id: str, turn_id: str):
     derived from. The UI uses this to render red dotted underlines on
     unbacked numbers.
     """
-    claims_path = RUNS_DIR / session_id / turn_id / "claims.json"
+    runs_dir = active_paths().runs_dir
+    claims_path = runs_dir / session_id / turn_id / "claims.json"
     if not claims_path.is_file():
-        # Fallback: look for the expert-written variant under any
-        # delegation's expert dir, in case the auditor wrote it there.
-        expert_root = RUNS_DIR / session_id / turn_id / "expert"
+        expert_root = runs_dir / session_id / turn_id / "expert"
         if expert_root.is_dir():
             for sub in sorted(expert_root.iterdir()):
                 candidate = sub / "claims.json"
@@ -165,6 +347,45 @@ async def get_turn_claims(session_id: str, turn_id: str):
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read claims: {exc}")
     return data
+
+
+@app.get("/turns/{session_id}/{turn_id}/expert/{delegation_id}/stdout")
+async def get_expert_stdout_event(
+    session_id: str,
+    turn_id: str,
+    delegation_id: str,
+    eventIndex: int = Query(...),
+):
+    """Return a single event from an expert delegation's ``stdout.jsonl``.
+
+    Used by the chat-UI ``ToolOutputPopover`` when a user clicks a claim
+    whose source is ``{kind: "tool_output", delegationId, eventIndex}``.
+    We only ever send one event so payloads stay tiny regardless of how
+    chatty the expert was.
+    """
+    if eventIndex < 0:
+        raise HTTPException(status_code=400, detail="eventIndex must be >= 0")
+    stdout_path = (
+        active_paths().runs_dir / session_id / turn_id / "expert" / delegation_id / "stdout.jsonl"
+    )
+    if not stdout_path.is_file():
+        raise HTTPException(status_code=404, detail="stdout.jsonl not found")
+    try:
+        with stdout_path.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i != eventIndex:
+                    continue
+                line = line.strip()
+                if not line:
+                    raise HTTPException(status_code=404, detail="Empty event")
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    return {"eventIndex": eventIndex, "raw": line}
+                return {"eventIndex": eventIndex, "event": event}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read stdout: {exc}")
+    raise HTTPException(status_code=404, detail="eventIndex out of range")
 
 
 @app.patch("/turns/{session_id}/{turn_id}/citations")
@@ -223,8 +444,8 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
 
 @app.get("/skills")
 def list_skills():
-    """Return metadata for all installed Gemini skills."""
-    skills_dir = SANDBOX_ROOT / ".gemini" / "skills"
+    """Return metadata for all installed Gemini skills in the active project."""
+    skills_dir = active_paths().gemini_settings_dir / "skills"
     if not skills_dir.is_dir():
         return []
 
@@ -255,8 +476,9 @@ def list_skills():
 
 @app.get("/sandbox/tree")
 def sandbox_tree():
-    """Return the sandbox directory as a nested tree structure."""
-    if not SANDBOX_ROOT.exists():
+    """Return the active project's sandbox as a nested tree structure."""
+    sandbox_root = active_paths().sandbox
+    if not sandbox_root.exists():
         return {"name": "sandbox", "type": "directory", "children": []}
 
     def build_tree(directory: Path, depth: int = 0) -> dict:
@@ -273,7 +495,11 @@ def sandbox_tree():
                 continue
             if entry.name in _ZIP_EXCLUDED_NAMES:
                 continue
-            rel = str(entry.relative_to(SANDBOX_ROOT))
+            # Hide annotation sidecars; they are managed metadata, not
+            # user-visible files. See /sandbox/annotations.
+            if entry.is_file() and entry.name.endswith(".annotations.json"):
+                continue
+            rel = str(entry.relative_to(sandbox_root))
             if entry.is_dir():
                 child = build_tree(entry, depth + 1)
                 child["path"] = rel
@@ -287,12 +513,9 @@ def sandbox_tree():
                 })
         return node
 
-    tree = build_tree(SANDBOX_ROOT)
+    tree = build_tree(sandbox_root)
     tree["path"] = ""
     return tree
-
-
-UPLOAD_DIR = SANDBOX_ROOT / "user_data"
 
 
 @app.post("/sandbox/upload")
@@ -300,8 +523,11 @@ async def sandbox_upload(
     files: list[UploadFile],
     paths: list[str] = Form(default=[]),
 ):
-    """Upload files into sandbox/user_data, preserving directory structure."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    """Upload files into the active project's ``sandbox/user_data``."""
+    paths_obj = active_paths()
+    upload_dir = paths_obj.upload_dir
+    sandbox_root = paths_obj.sandbox
+    upload_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     for i, f in enumerate(files):
         if not f.filename:
@@ -312,16 +538,17 @@ async def sandbox_upload(
             safe_parts = [p for p in parts if p not in ("..", ".") and not p.startswith(".")]
             if not safe_parts:
                 continue
-            dest = UPLOAD_DIR / Path(*safe_parts)
+            dest = upload_dir / Path(*safe_parts)
         else:
             safe_name = Path(f.filename).name
             if not safe_name or safe_name.startswith("."):
                 continue
-            dest = UPLOAD_DIR / safe_name
+            dest = upload_dir / safe_name
         dest.parent.mkdir(parents=True, exist_ok=True)
         content = await f.read()
         dest.write_bytes(content)
-        saved.append(str(dest.relative_to(SANDBOX_ROOT)))
+        saved.append(str(dest.relative_to(sandbox_root)))
+    touch_project(ACTIVE_PROJECT.get())
     return {"uploaded": saved}
 
 
@@ -346,6 +573,7 @@ async def sandbox_save_file(request: Request, path: str = Query(...)):
     target.parent.mkdir(parents=True, exist_ok=True)
     body = await request.body()
     target.write_bytes(body)
+    touch_project(ACTIVE_PROJECT.get())
     return {"saved": path, "size": len(body)}
 
 
@@ -356,18 +584,28 @@ def sandbox_delete(path: str = Query(...)):
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     target.unlink()
+    # Cascade: remove an annotation sidecar if this was an annotatable file.
+    sidecar = target.with_name(target.name + ".annotations.json")
+    if sidecar.is_file():
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
+    touch_project(ACTIVE_PROJECT.get())
     return {"deleted": path}
 
 
 @app.delete("/sandbox/directory")
 def sandbox_delete_directory(path: str = Query(...)):
     """Recursively delete a directory from the sandbox."""
+    sandbox_root = active_paths().sandbox
     target = _safe_path(path)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="Directory not found")
-    if target == SANDBOX_ROOT:
+    if target == sandbox_root:
         raise HTTPException(status_code=403, detail="Cannot delete sandbox root")
     shutil.rmtree(target)
+    touch_project(ACTIVE_PROJECT.get())
     return {"deleted": path}
 
 
@@ -385,6 +623,18 @@ def sandbox_move(src: str = Body(...), dest: str = Body(...)):
     if src_path.is_dir() and dest_path.is_relative_to(src_path):
         raise HTTPException(status_code=400, detail="Cannot move a directory into itself")
     shutil.move(str(src_path), str(dest_path))
+    # Cascade: move the annotation sidecar alongside a file move/rename.
+    if src_path.is_file() or dest_path.is_file():
+        src_sidecar = src_path.with_name(src_path.name + ".annotations.json")
+        if src_sidecar.exists():
+            dest_sidecar = dest_path.with_name(dest_path.name + ".annotations.json")
+            try:
+                dest_sidecar.parent.mkdir(parents=True, exist_ok=True)
+                if not dest_sidecar.exists():
+                    shutil.move(str(src_sidecar), str(dest_sidecar))
+            except OSError:
+                pass
+    touch_project(ACTIVE_PROJECT.get())
     return {"ok": True}
 
 
@@ -397,6 +647,7 @@ def sandbox_mkdir(path: str = Body(..., embed=True)):
     if not target.parent.exists():
         raise HTTPException(status_code=404, detail="Parent directory not found")
     target.mkdir()
+    touch_project(ACTIVE_PROJECT.get())
     return {"ok": True}
 
 
@@ -426,6 +677,135 @@ def sandbox_download_dir(path: str = Query(...)):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{archive_name}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Annotation sidecars: <pdf-rel>.annotations.json next to the file.
+# Hidden from /sandbox/tree; cascaded on delete/move; edited through these
+# dedicated endpoints so the frontend and the expert-side MCP both go
+# through validation and atomic writes.
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_ANNOTATIONS = {"version": 1, "annotations": []}
+
+
+def _sidecar_for(pdf_rel: str) -> Path:
+    target = _safe_path(pdf_rel)
+    if target.name.endswith(".annotations.json"):
+        raise HTTPException(status_code=400, detail="Refusing to annotate a sidecar")
+    sidecar = target.with_name(target.name + ".annotations.json")
+    sandbox_root = active_paths().sandbox
+    if not sidecar.resolve().is_relative_to(sandbox_root):
+        raise HTTPException(status_code=403, detail="Path traversal denied")
+    return sidecar
+
+
+def _normalize_annotations_doc(data) -> dict:
+    """Enforce the minimal on-disk schema: {version, annotations: [...]}.
+    Unknown fields on individual annotations pass through (forward-compat).
+    """
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Annotations body must be a JSON object")
+    anns = data.get("annotations")
+    if anns is None:
+        anns = []
+    if not isinstance(anns, list):
+        raise HTTPException(status_code=400, detail="'annotations' must be a list")
+    for i, ann in enumerate(anns):
+        if not isinstance(ann, dict):
+            raise HTTPException(status_code=400, detail=f"annotations[{i}] must be an object")
+        if not ann.get("id") or not isinstance(ann["id"], str):
+            raise HTTPException(status_code=400, detail=f"annotations[{i}].id is required")
+        if ann.get("type") not in ("highlight", "note"):
+            raise HTTPException(status_code=400, detail=f"annotations[{i}].type must be 'highlight' or 'note'")
+        if not isinstance(ann.get("page"), int) or ann["page"] < 1:
+            raise HTTPException(status_code=400, detail=f"annotations[{i}].page must be a positive int")
+        author = ann.get("author")
+        if not isinstance(author, dict) or author.get("kind") not in ("user", "expert"):
+            raise HTTPException(status_code=400, detail=f"annotations[{i}].author.kind invalid")
+    return {"version": 1, "annotations": anns}
+
+
+def _http_date(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return format_datetime(dt, usegmt=True)
+
+
+@app.get("/sandbox/annotations")
+def sandbox_get_annotations(response: Response, path: str = Query(...)):
+    """Read the annotation sidecar for a given sandbox file.
+
+    Returns an empty doc (``{"version":1,"annotations":[]}``) when the
+    sidecar does not exist yet. Sets ``Last-Modified`` so the client can
+    pass ``If-Unmodified-Since`` on subsequent writes and cheaply poll.
+    """
+    sidecar = _sidecar_for(path)
+    if not sidecar.is_file():
+        response.headers["Cache-Control"] = "no-store"
+        return _EMPTY_ANNOTATIONS
+
+    try:
+        raw = sidecar.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else _EMPTY_ANNOTATIONS
+    except (OSError, json.JSONDecodeError):
+        return _EMPTY_ANNOTATIONS
+
+    mtime = datetime.fromtimestamp(sidecar.stat().st_mtime, tz=timezone.utc)
+    response.headers["Last-Modified"] = _http_date(mtime)
+    response.headers["Cache-Control"] = "no-store"
+    return data
+
+
+@app.put("/sandbox/annotations")
+async def sandbox_put_annotations(
+    request: Request,
+    response: Response,
+    path: str = Query(...),
+):
+    """Overwrite the annotation sidecar with a new JSON document.
+
+    If the client sends ``If-Unmodified-Since`` and the sidecar has been
+    written since that timestamp (e.g. by the expert-side MCP), respond
+    with 412 so the client can re-read, merge, and retry.
+    """
+    sidecar = _sidecar_for(path)
+
+    if sidecar.exists():
+        precond = request.headers.get("if-unmodified-since")
+        if precond:
+            try:
+                expected = parsedate_to_datetime(precond)
+                if expected.tzinfo is None:
+                    expected = expected.replace(tzinfo=timezone.utc)
+                actual = datetime.fromtimestamp(
+                    sidecar.stat().st_mtime, tz=timezone.utc
+                )
+                # HTTP-date has 1s precision; allow that much slack.
+                if (actual - expected).total_seconds() > 1:
+                    raise HTTPException(status_code=412, detail="Sidecar modified; re-read and retry")
+            except HTTPException:
+                raise
+            except (TypeError, ValueError):
+                pass
+
+    body_bytes = await request.body()
+    try:
+        incoming = json.loads(body_bytes.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
+    doc = _normalize_annotations_doc(incoming)
+
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, sidecar)
+    touch_project(ACTIVE_PROJECT.get())
+
+    mtime = datetime.fromtimestamp(sidecar.stat().st_mtime, tz=timezone.utc)
+    response.headers["Last-Modified"] = _http_date(mtime)
+    return {"saved": path, "count": len(doc["annotations"])}
 
 
 @app.get("/sandbox/raw")
@@ -462,17 +842,18 @@ def sandbox_download(path: str = Query(...)):
 @app.get("/sandbox/download-all")
 def sandbox_download_all():
     """Download the entire sandbox as a zip archive."""
-    if not SANDBOX_ROOT.exists():
+    sandbox_root = active_paths().sandbox
+    if not sandbox_root.exists():
         raise HTTPException(status_code=404, detail="Sandbox is empty")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in sorted(SANDBOX_ROOT.rglob("*")):
-            rel_parts = file_path.relative_to(SANDBOX_ROOT).parts
+        for file_path in sorted(sandbox_root.rglob("*")):
+            rel_parts = file_path.relative_to(sandbox_root).parts
             if file_path.is_file() and not any(
                 p.startswith(".") for p in rel_parts
             ) and file_path.name not in _ZIP_EXCLUDED_NAMES:
-                zf.write(file_path, file_path.relative_to(SANDBOX_ROOT))
+                zf.write(file_path, file_path.relative_to(sandbox_root))
     buf.seek(0)
 
     if buf.getbuffer().nbytes <= 22:
@@ -482,6 +863,60 @@ def sandbox_download_all():
         buf,
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="sandbox.zip"'},
+    )
+
+
+_H5AD_SUFFIXES = (".h5ad",)
+
+
+def _require_h5ad(target: Path) -> None:
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    if not target.name.lower().endswith(_H5AD_SUFFIXES):
+        raise HTTPException(status_code=400, detail="Not a .h5ad file")
+
+
+@app.get("/sandbox/anndata-summary")
+def sandbox_anndata_summary(path: str = Query(...)):
+    """Return a JSON summary of an .h5ad file.
+
+    Opens the file in ``backed="r"`` mode so shape/dtype/obs/var/obsm can
+    be introspected without loading the full matrix into memory.
+    """
+    target = _safe_path(path)
+    _require_h5ad(target)
+    try:
+        return summarize_h5ad(target)
+    except AnnDataDepsMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to read h5ad: {exc}")
+
+
+@app.get("/sandbox/anndata-embedding.png")
+def sandbox_anndata_embedding(
+    path: str = Query(...),
+    key: str = Query(...),
+    color: Optional[str] = Query(default=None),
+):
+    """Render the first 2 dims of ``adata.obsm[key]`` as a cached PNG."""
+    target = _safe_path(path)
+    _require_h5ad(target)
+    cache_dir = active_paths().sandbox.parent / ".anndata_cache"
+    try:
+        data = render_embedding_png(target, key=key, color=color, cache_dir=cache_dir)
+    except AnnDataDepsMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to render embedding: {exc}")
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=300"},
     )
 
 
@@ -548,9 +983,124 @@ async def sandbox_compile_latex(request: Request):
     errors = _LATEX_ERROR_RE.findall(log_text)
     success = proc.returncode == 0 and pdf_path.is_file()
 
+    sandbox_root = active_paths().sandbox
     return {
         "success": success,
-        "pdf_path": str(pdf_path.relative_to(SANDBOX_ROOT)) if pdf_path.is_file() else None,
+        "pdf_path": str(pdf_path.relative_to(sandbox_root)) if pdf_path.is_file() else None,
         "log": log_text[-8000:] if len(log_text) > 8000 else log_text,
         "errors": errors,
     }
+
+
+# ---------------------------------------------------------------------------
+# Lightweight markdown revision — bypasses the full ADK agent/delegation stack.
+# Called from the in-tab "Ask Kady to revise" popover on markdown files.
+# ---------------------------------------------------------------------------
+
+
+_MD_FENCE_RE = re.compile(
+    r"\A\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_md_fence(text: str) -> str:
+    """Remove an outer ```markdown fence if the model wrapped its reply."""
+    m = _MD_FENCE_RE.match(text)
+    return m.group(1) if m else text
+
+
+_REVISE_SYSTEM_PROMPT = (
+    "You are a precise markdown editor. You will be given a SELECTION from a "
+    "markdown document together with optional BEFORE/AFTER context and a user "
+    "INSTRUCTION.\n\n"
+    "Your job: rewrite ONLY the SELECTION to satisfy the instruction. Preserve "
+    "the surrounding markdown syntax conventions (headings, list markers, "
+    "emphasis, code fences, tables) that are visible in the selection. Keep the "
+    "revised text stylistically consistent with the BEFORE/AFTER context but do "
+    "NOT repeat or rewrite that context.\n\n"
+    "Return ONLY the revised markdown for the selection. No preamble, no "
+    "explanation, no surrounding ```markdown fences, no quotes. Output must be "
+    "drop-in replaceable text."
+)
+
+
+@app.post("/revise-markdown")
+async def revise_markdown(request: Request):
+    """Revise a markdown selection using the configured default model.
+
+    Body: ``{"selection": str, "instruction": str, "before"?: str, "after"?: str,
+    "model"?: str}``. Returns ``{"revised": str}``.
+    """
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+
+    selection = str(data.get("selection") or "")
+    instruction = str(data.get("instruction") or "").strip()
+    before = str(data.get("before") or "")[-800:]
+    after = str(data.get("after") or "")[:800]
+    model_override = data.get("model")
+
+    if not selection.strip():
+        raise HTTPException(status_code=400, detail="selection is required")
+    if not instruction:
+        raise HTTPException(status_code=400, detail="instruction is required")
+
+    # Import lazily so that `server.py` can still import even if optional
+    # agent deps are missing at boot time.
+    import litellm
+    from kady_agent.agent import DEFAULT_MODEL, EXTRA_HEADERS
+
+    model = (
+        str(model_override).strip()
+        if isinstance(model_override, str) and model_override.strip()
+        else DEFAULT_MODEL
+    )
+    if not model:
+        raise HTTPException(
+            status_code=500,
+            detail="No model configured (set DEFAULT_AGENT_MODEL or pass 'model').",
+        )
+
+    user_message_parts = [f"INSTRUCTION:\n{instruction}"]
+    if before:
+        user_message_parts.append(
+            "BEFORE (context only — do NOT rewrite):\n" + before
+        )
+    if after:
+        user_message_parts.append(
+            "AFTER (context only — do NOT rewrite):\n" + after
+        )
+    user_message_parts.append("SELECTION (rewrite this):\n" + selection)
+    user_message = "\n\n".join(user_message_parts)
+
+    try:
+        response = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": _REVISE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            extra_headers=EXTRA_HEADERS,
+            temperature=0.2,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface upstream errors verbatim
+        raise HTTPException(status_code=502, detail=f"Model call failed: {exc}")
+
+    try:
+        revised = response.choices[0].message.content or ""
+    except (AttributeError, IndexError, KeyError) as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Unexpected model response shape: {exc}"
+        )
+
+    revised = _strip_md_fence(revised.strip())
+    if not revised:
+        raise HTTPException(status_code=502, detail="Model returned empty revision")
+
+    return {"revised": revised, "model": model}

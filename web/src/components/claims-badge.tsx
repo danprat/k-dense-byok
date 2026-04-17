@@ -75,12 +75,13 @@ export function useClaimsUnderlines(
       const original = node.nodeValue ?? "";
       if (!original.trim()) continue;
 
-      let match: { claim: ClaimEntry; index: number } | null = null;
-      for (const claim of sorted) {
+      let match: { claim: ClaimEntry; index: number; claimIndex: number } | null = null;
+      for (let i = 0; i < sorted.length; i++) {
+        const claim = sorted[i];
         if (!claim.text) continue;
         const idx = original.indexOf(claim.text);
         if (idx >= 0 && (!match || idx < match.index)) {
-          match = { claim, index: idx };
+          match = { claim, index: idx, claimIndex: claims.indexOf(claim) };
         }
       }
       if (!match) continue;
@@ -93,15 +94,32 @@ export function useClaimsUnderlines(
       const after = original.slice(match.index + match.claim.text.length);
 
       const span = document.createElement("span");
+      const sourceKind = match.claim.source?.kind ?? "none";
+      const clickable = sourceKind !== "none";
       span.className = cn(
         "kady-claim",
-        STATUS_META[match.claim.status].underline
+        STATUS_META[match.claim.status].underline,
+        clickable && "cursor-pointer hover:opacity-70"
       );
       span.dataset.claimStatus = match.claim.status;
-      if (match.claim.source?.file) {
-        span.title = `${match.claim.status} - ${match.claim.source.file}${
-          match.claim.source.line ? `:${match.claim.source.line}` : ""
-        }${match.claim.source.value ? ` (value: ${match.claim.source.value})` : ""}`;
+      span.dataset.claimIndex = String(match.claimIndex);
+      if (clickable) {
+        span.setAttribute("role", "button");
+        span.setAttribute("tabindex", "0");
+      }
+      const src = match.claim.source;
+      if (src?.kind === "file" && src.file) {
+        span.title = `${match.claim.status} - ${src.file}${
+          src.line ? `:${src.line}` : ""
+        }${src.value ? ` (value: ${src.value})` : ""} (click to open)`;
+      } else if (src?.kind === "notebook" && src.file) {
+        span.title = `${match.claim.status} - ${src.file} cell ${src.cell}${
+          src.line ? `:${src.line}` : ""
+        }${src.value ? ` (value: ${src.value})` : ""} (click to open)`;
+      } else if (src?.kind === "tool_output") {
+        span.title = `${match.claim.status} - tool output event #${src.eventIndex}${
+          src.value ? ` (value: ${src.value})` : ""
+        } (click to view)`;
       } else {
         span.title = `${match.claim.status} - no source located`;
       }

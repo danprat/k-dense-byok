@@ -193,8 +193,154 @@ cat > .kady/expert/$KADY_DELEGATION_ID/deliverables.json <<'EOF'
 EOF
 ```
 
+### Step 4 — Write `claims.json` (required when you produced code)
+
+Whenever your reply contains **any user-facing numbers** and you ran code, wrote files, or executed shell commands in this delegation, you **must** emit a `claims.json` file at:
+
+```
+.kady/expert/$KADY_DELEGATION_ID/claims.json
+```
+
+listing **every** number that will appear in the reply the user reads — percentages, p-values, counts, ratios, sample sizes, durations, dollar amounts, effect sizes, accuracies, loss values, table cells rephrased in prose. Each entry points to the exact source that produced the number. The UI underlines these numbers in the chat panel; numbers without a backing source render with a red underline.
+
+**Schema** (write a JSON object with a `claims` array):
+
+```json
+{
+  "turnId": "$KADY_TURN_ID",
+  "scannedAt": "<ISO8601 UTC>",
+  "claims": [
+    {
+      "text": "p = 0.03",
+      "context": "shortest surrounding sentence from your reply",
+      "status": "verified",
+      "source": {
+        "kind": "file",
+        "file": "report/analysis.py",
+        "line": 42,
+        "value": "0.0284"
+      }
+    },
+    {
+      "text": "42",
+      "context": "We processed 42 samples.",
+      "status": "verified",
+      "source": {
+        "kind": "notebook",
+        "file": "analysis.ipynb",
+        "cell": 3,
+        "line": 12,
+        "value": "42"
+      }
+    },
+    {
+      "text": "1.7x speedup",
+      "context": "This yielded a 1.7x speedup.",
+      "status": "approximate",
+      "source": {
+        "kind": "tool_output",
+        "delegationId": "$KADY_DELEGATION_ID",
+        "eventIndex": 17,
+        "value": "1.73"
+      }
+    },
+    {
+      "text": "roughly a third",
+      "context": "Roughly a third of reads mapped.",
+      "status": "unbacked",
+      "source": { "kind": "none" }
+    }
+  ]
+}
+```
+
+**Source kinds:**
+
+- `file` — a plain source file and line number you wrote or read. `file` is a sandbox-relative path.
+- `notebook` — a cell in a `.ipynb` you wrote. `cell` is the 0-based cell index; `line` is the 0-based line inside that cell's source.
+- `tool_output` — a specific event in **your own** stream-json stdout. `delegationId` should be `$KADY_DELEGATION_ID`; `eventIndex` is the 0-based index of the event in `stdout.jsonl` (e.g. the `tool_use` or `tool_result` line whose output carries the number).
+- `none` — no traceable source. Use with `status: "unbacked"`.
+
+**Status values:**
+
+- `verified` — the number in your reply matches the source value exactly (or within a sensible rounding that preserves all reported significant figures).
+- `approximate` — the reply rounds or rephrases the source value; include the literal source value under `source.value`.
+- `ambiguous` — you are not sure which of several candidate sources produced the number.
+- `unbacked` — you asserted the number without a traceable source. Do **not** guess a source — record `"kind": "none"`.
+
+**Rules:**
+
+1. List **every** user-facing number, including approximations and unbacked ones. The frontend will render exactly what you declare.
+2. `text` must be an **exact substring** of your assistant reply; the UI finds and underlines it by substring match.
+3. Do not list numbers that appear only inside code fences in your reply — the UI skips those.
+4. If you produced no code and no numbers, you may skip this step.
+
 ### Failure mode
 
-If you skip these steps, the manifest records `envLockPath: null` for your delegation and the methods paragraph will note "(env lock unavailable for delegation X)." This degrades reviewer trust in the result and is not acceptable for any task involving computation or sampling.
+If you skip these steps, the manifest records `envLockPath: null` for your delegation and the methods paragraph will note "(env lock unavailable for delegation X)." If you produced code but skipped `claims.json`, every number in your reply will render with a red underline in the chat UI, signalling to the user that the numbers are unbacked. Either outcome degrades reviewer trust and is not acceptable for any task involving computation or sampling.
 
 </PROTOCOL:REPRODUCIBILITY>
+
+---
+
+<PROTOCOL:PDF_ANNOTATIONS>
+
+## PDF annotations — how to mark up a paper the user is reading
+
+When your task involves a PDF that the user attached (literature review, methods critique, figure discussion, etc.), you can drop **annotations** directly onto the PDF via the `pdf-annotations` MCP server. The user-facing PDF viewer renders them in a distinct color with your label, so the user can jump straight to the specific passage or region you are discussing.
+
+### When to use
+
+- You cite or paraphrase a specific passage. Drop a `highlight` on that passage.
+- You have a methods concern tied to a figure, table, or paragraph. Drop a `note` next to it.
+- You want to flag a page-scale issue (e.g. "Table S2 is where the variance-assumption violation lives"). Drop a `note`.
+
+Do **not** use annotations as a general scratchpad — each one should be a finding the user benefits from jumping to.
+
+### Tool surface
+
+- `add_pdf_annotation(pdf_path, type, page, ...)` — creates one annotation and returns its record (including the generated `id`).
+- `list_pdf_annotations(pdf_path, author_kind?, page?)` — read current annotations. Useful to avoid duplicating a finding.
+- `remove_pdf_annotation(pdf_path, annotation_id)` — remove an annotation you authored (expert-authored by default; you cannot remove user annotations without `force=True`).
+
+`pdf_path` is the sandbox-relative path the user saw — the same string you would pass to `read_file`.
+
+### Coordinate system
+
+Rects and anchors are in **PDF user-space points**: the PDF page coordinate system with origin at the **bottom-left**, `y` growing **upward**, units in points (1/72"). Pages are **1-indexed**. These coordinates are page-local — independent of zoom.
+
+If you do not have exact coordinates (for example, you identified a passage by reading the extracted text), you can still add a `note` at a plausible anchor near the top of the page. Prefer `note` over `highlight` when you are uncertain of exact rect coordinates — a sticky note near the top of a page is always correct, a mis-aligned highlight is worse than none.
+
+### Highlight example
+
+```
+add_pdf_annotation(
+  pdf_path="papers/smith2024.pdf",
+  type="highlight",
+  page=3,
+  rects=[{"x": 72.0, "y": 540.2, "w": 420.0, "h": 12.0}],
+  text="We assumed normally distributed residuals throughout.",
+  note="Residuals are not normal — see Fig 4B right panel.",
+)
+```
+
+### Note example
+
+```
+add_pdf_annotation(
+  pdf_path="papers/smith2024.pdf",
+  type="note",
+  page=1,
+  anchor={"x": 200, "y": 720},
+  body="Primary endpoint changed between preregistration and publication; see trial registry NCT01234567.",
+)
+```
+
+### Rules
+
+1. One annotation per distinct finding. Do not bulk-dump the entire paper.
+2. For highlights, always include the `text` you are highlighting — the user scans the sidebar by it.
+3. Keep note bodies short (one or two sentences). Put longer reasoning in your main reply and reference the annotation by its location ("see my note on p.3").
+4. Do not remove user-authored annotations.
+
+</PROTOCOL:PDF_ANNOTATIONS>

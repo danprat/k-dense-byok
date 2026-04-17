@@ -28,6 +28,17 @@ model_list:
       <<: *openrouter_shared
       model: google/gemini-3.1-flash-lite-preview
 
+  # ── Local Ollama (no API key required) ──
+  # Wildcard so any tag the user pulls into their Ollama server is routable
+  # without editing this file. `ollama_chat/*` preserves the model name tag
+  # (e.g. `ollama/llama3.2:3b` -> `ollama_chat/llama3.2:3b`).
+  - model_name: "ollama/*"
+    litellm_params:
+      model: "ollama_chat/*"
+      api_base: os.environ/OLLAMA_BASE_URL
+      timeout: 600
+      stream_timeout: 600
+
 router_settings:
   # Retry failed routing attempts (helps flaky upstream / transient errors)
   num_retries: 4
