@@ -1,4 +1,4 @@
-"""Per-turn run manifests for reproducibility and defensible claims.
+"""Per-turn run manifests for reproducibility.
 
 Writes a ``manifest.json`` describing every turn:
 
@@ -34,7 +34,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .claims import build_turn_claims_doc, summarize_claims
 from .gemini_settings import build_default_settings, load_custom_mcps
 from .projects import active_paths
 
@@ -291,7 +290,6 @@ async def open_turn(
             "durationMs": 0,
         },
         "citations": None,
-        "claims": None,
         "startedAt": time.time(),
     }
 
@@ -319,8 +317,6 @@ async def attach_delegation(
     stdout: str | None = None,
     env_lock: str | None = None,
     deliverables: list[str] | None = None,
-    claims: list[dict] | None = None,
-    produced_code: bool = False,
 ) -> None:
     """Append a delegation record to the manifest and persist side files."""
     lock = _manifest_lock(turn_id)
@@ -357,31 +353,6 @@ async def attach_delegation(
             except OSError:
                 pass
 
-        claims_count: int | None = None
-        claims_path_rel: str | None = None
-        if claims:
-            claims_count = len(claims)
-            try:
-                (expert_dir / "claims.json").write_text(
-                    json.dumps(claims, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                claims_path_rel = f"expert/{delegation_id}/claims.json"
-            except OSError:
-                pass
-
-            # Merge this delegation's claims into the turn-level claims.json
-            # so GET /turns/{s}/{t}/claims returns a single concatenated list.
-            turn_claims_path = turn_dir / "claims.json"
-            existing_doc = _read_json(turn_claims_path) or {}
-            existing_claims = existing_doc.get("claims") if isinstance(existing_doc, dict) else None
-            base: list[dict] = list(existing_claims) if isinstance(existing_claims, list) else []
-            base.extend(claims)
-            _write_json(
-                turn_claims_path,
-                build_turn_claims_doc(turn_id=turn_id, entries=base),
-            )
-
         manifest = _read_json(turn_dir / "manifest.json") or {}
         manifest.setdefault("delegations", []).append(
             {
@@ -394,26 +365,8 @@ async def attach_delegation(
                 "envLockPath": env_lock_path,
                 "deliverables": deliverables_list,
                 "promptDir": f"expert/{delegation_id}",
-                "producedCode": bool(produced_code),
-                "claimsCount": claims_count,
-                "claimsPath": claims_path_rel,
             }
         )
-
-        # Recompute the turn-level claims summary + producedCode flag so the
-        # frontend can auto-trigger on the cheap manifest endpoint.
-        turn_claims_doc = _read_json(turn_dir / "claims.json") or {}
-        turn_claims_list = (
-            turn_claims_doc.get("claims") if isinstance(turn_claims_doc, dict) else None
-        )
-        if isinstance(turn_claims_list, list) and turn_claims_list:
-            summary = summarize_claims(turn_claims_list)
-        else:
-            summary = {"total": 0, "verified": 0, "approximate": 0, "unbacked": 0, "ambiguous": 0}
-        summary["producedCode"] = any(
-            bool(d.get("producedCode")) for d in manifest.get("delegations", [])
-        )
-        manifest["claims"] = summary
 
         _write_json(turn_dir / "manifest.json", manifest)
 

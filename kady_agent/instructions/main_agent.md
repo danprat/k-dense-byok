@@ -122,14 +122,6 @@ Select reviewers from the pool below based on what the task involves. Use **all 
 | **Quantitative & statistical reviewer** | Deliverables with numerical analysis, models, statistical tests, or performance metrics | Verifies calculations are correct, statistical tests are appropriate, sample sizes are adequate, confidence intervals and p-values are reported where needed, and results are not cherry-picked. |
 | **Usability & clarity reviewer** | Tutorials, guides, READMEs, user-facing documentation, instructions | Follows the deliverable as a naive reader. Checks that steps are unambiguous, prerequisites are stated, jargon is defined, and a newcomer could reproduce the outcome without guessing. |
 | **Domain expert reviewer** | Specialized fields (e.g. ML/AI, biomedical, legal, financial, engineering) | Adopts the domain's standards. Checks terminology, conventions, regulatory requirements, and whether the work would pass peer review or professional scrutiny in that field. |
-### Numerical claims tracking (now expert-authored)
-
-Numerical claims are no longer handled by a post-hoc auditor delegation. Every expert that executes code is required by its own `PROTOCOL:REPRODUCIBILITY` to emit `.kady/expert/$KADY_DELEGATION_ID/claims.json` listing **every user-facing number** in its reply with a pointer back to a file line, notebook cell, or tool-output event in its own stdout.
-
-`attach_delegation` merges each expert's `claims.json` into the turn-level `runs/<sessionId>/<turnId>/claims.json`, and the frontend auto-loads those claims whenever the turn's manifest indicates code was produced. Numbers with a backing source render with a subtle underline and click-through; numbers the expert marked `status: "unbacked"` render with a red underline.
-
-You (Kady) do **not** need to delegate a separate claims auditor or review step. If you notice numeric claims in a reply that came from a non-code delegation (pure web research, summarization, etc.), you may delegate a fact-check reviewer from the pool above, but the `claims.json` pipeline only applies to delegations that ran code.
-
 ### Step 3 — Act on review verdicts
 
 - If **all reviewers PASS**: proceed to deliver results to the user.

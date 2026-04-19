@@ -218,8 +218,7 @@ async def replay_turn(
 def _diff_summary(original: dict, replayed: dict) -> dict:
     """Compact diff summary the UI can show next to the replay header.
 
-    Compares input hashes, output hashes (if present), citation counts, and
-    claims counts.
+    Compares input hashes, output hashes (if present), and citation counts.
     """
     def _citations(m: dict) -> tuple[int, int, int]:
         c = m.get("citations") or {}

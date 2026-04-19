@@ -29,13 +29,12 @@ import { DatabaseSelector, buildDatabaseContext, type Database } from "@/compone
 import { ComputeSelector, buildComputeContext, type ModalInstance } from "@/components/compute-selector";
 import { PairedModelSelector, DEFAULT_MODEL, DEFAULT_EXPERT_MODEL, type Model } from "@/components/model-selector";
 import { SkillsSelector, buildSkillsContext, type Skill } from "@/components/skills-selector";
+import { BrowserSelector, buildBrowserContext } from "@/components/browser-selector";
+import { useBrowserUseSettings, useChromeProfiles } from "@/lib/use-settings";
 import { ProvenancePanel } from "@/components/provenance-panel";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { WorkflowsPanel } from "@/components/workflows-panel";
 import { CitationBadge } from "@/components/citation-badge";
-import { ClaimsBadge, useClaimsUnderlines } from "@/components/claims-badge";
-import { ToolOutputPopover, type ToolOutputTarget } from "@/components/tool-output-popover";
-import type { ClaimEntry } from "@/lib/use-agent";
 import { ProjectSwitcher } from "@/components/project-switcher";
 import type { ChatMessage } from "@/lib/use-agent";
 import { APP_VERSION, useUpdateCheck } from "@/lib/version";
@@ -531,6 +530,8 @@ function ChatInput({
   onRemoveFromQueue: (id: string) => void;
 }) {
   const controller = usePromptInputController();
+  const browserUse = useBrowserUseSettings();
+  const chromeProfiles = useChromeProfiles();
 
   const handleFilesUpload = useCallback(async (files: FileList | File[], paths?: string[]) => {
     const uploaded = await onUploadFiles(files, paths);
@@ -544,10 +545,11 @@ function ChatInput({
       const dbCtx = buildDatabaseContext(selectedDbs);
       const computeCtx = buildComputeContext(selectedCompute);
       const skillsCtx = buildSkillsContext(selectedSkills);
-      onSubmit({ ...msg, text: msg.text + refs + dbCtx + computeCtx + skillsCtx }, event);
+      const browserCtx = buildBrowserContext(browserUse.config, chromeProfiles.profiles);
+      onSubmit({ ...msg, text: msg.text + refs + dbCtx + computeCtx + skillsCtx + browserCtx }, event);
       onClearFiles();
     },
-    [onSubmit, attachedFiles, onClearFiles, selectedDbs, selectedCompute, selectedSkills]
+    [onSubmit, attachedFiles, onClearFiles, selectedDbs, selectedCompute, selectedSkills, browserUse.config, chromeProfiles.profiles]
   );
 
   // @ mention state
@@ -732,6 +734,7 @@ function ChatInput({
               <DatabaseSelector selected={selectedDbs} onChange={onDbsChange} />
               <ComputeSelector selected={selectedCompute} onChange={onComputeChange} modalConfigured={modalConfigured} />
               <SkillsSelector skills={allSkills} selected={selectedSkills} onChange={onSkillsChange} />
+              <BrowserSelector />
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
               <SpeechInput
@@ -751,50 +754,21 @@ function ChatInput({
   );
 }
 
-function AssistantMessageBody({
-  message,
-  onRunClaims,
-  onClaimClick,
-}: {
-  message: ChatMessage;
-  onRunClaims: () => void;
-  onClaimClick: (claim: ClaimEntry, anchor: HTMLElement) => void;
-}) {
-  const bodyRef = useRef<HTMLDivElement | null>(null);
-  useClaimsUnderlines(bodyRef, message.claims?.claims);
-
-  const onContainerClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      const span = target.closest<HTMLElement>(".kady-claim");
-      if (!span || !bodyRef.current?.contains(span)) return;
-      const idxStr = span.dataset.claimIndex;
-      if (!idxStr) return;
-      const idx = Number(idxStr);
-      const entry = message.claims?.claims?.[idx];
-      if (!entry) return;
-      if (!entry.source || entry.source.kind === "none") return;
-      onClaimClick(entry, span);
-    },
-    [message.claims, onClaimClick]
-  );
-
+function AssistantMessageBody({ message }: { message: ChatMessage }) {
   return (
     <>
-      <div ref={bodyRef} onClick={onContainerClick}>
-        <MessageResponse>{message.content}</MessageResponse>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        {message.citations && <CitationBadge report={message.citations} />}
-        <ClaimsBadge report={message.claims} onRun={onRunClaims} />
-      </div>
+      <MessageResponse>{message.content}</MessageResponse>
+      {message.citations && (
+        <div className="flex flex-wrap items-center gap-2">
+          <CitationBadge report={message.citations} />
+        </div>
+      )}
     </>
   );
 }
 
 export default function ChatPage() {
-  const { messages, status, send, stop, reset, getSessionId, loadClaims } = useAgent();
+  const { messages, status, send, stop, reset, getSessionId } = useAgent();
   const isStreaming = status === "streaming" || status === "submitted";
   const sandbox = useSandbox(isStreaming);
   const config = useConfig();
@@ -1026,59 +1000,6 @@ export default function ChatPage() {
     sandbox.selectFile(path);
   }, [sandbox]);
 
-  // Claim source dispatcher: opens the referenced file/cell in the preview
-  // panel, or a ToolOutputPopover anchored at the clicked span.
-  const [revealTarget, setRevealTarget] = useState<
-    { path: string; line?: number; cell?: number; token: number } | null
-  >(null);
-  const [toolOutputTarget, setToolOutputTarget] = useState<ToolOutputTarget | null>(null);
-  const revealTokenRef = useRef(0);
-
-  const handleClaimClick = useCallback(
-    (claim: ClaimEntry, anchor: HTMLElement) => {
-      const src = claim.source;
-      if (!src) return;
-      if (src.kind === "file" && src.file) {
-        if (!panelOpen) setPanelOpen(true);
-        sandbox.selectFile(src.file);
-        revealTokenRef.current += 1;
-        setRevealTarget({
-          path: src.file,
-          line: typeof src.line === "number" ? src.line : undefined,
-          token: revealTokenRef.current,
-        });
-        setToolOutputTarget(null);
-      } else if (src.kind === "notebook" && src.file) {
-        if (!panelOpen) setPanelOpen(true);
-        sandbox.selectFile(src.file);
-        revealTokenRef.current += 1;
-        setRevealTarget({
-          path: src.file,
-          cell: typeof src.cell === "number" ? src.cell : undefined,
-          line: typeof src.line === "number" ? src.line : undefined,
-          token: revealTokenRef.current,
-        });
-        setToolOutputTarget(null);
-      } else if (src.kind === "tool_output") {
-        const sessionId = getSessionId();
-        const turnId = messages.find((m) => m.claims?.claims?.includes(claim))?.turnId;
-        if (!sessionId || !turnId || !src.delegationId || typeof src.eventIndex !== "number") {
-          return;
-        }
-        const rect = anchor.getBoundingClientRect();
-        setToolOutputTarget({
-          sessionId,
-          turnId,
-          delegationId: src.delegationId,
-          eventIndex: src.eventIndex,
-          anchor: rect,
-          value: src.value,
-        });
-      }
-    },
-    [sandbox, panelOpen, getSessionId, messages]
-  );
-
   return (
     <div className="flex h-dvh flex-col">
       {/* Header */}
@@ -1203,7 +1124,6 @@ export default function ChatPage() {
               onSaveImageBlob={sandbox.saveImageBlob}
               onRetry={sandbox.retryFile}
               onCompileLatex={sandbox.compileLatex}
-              revealTarget={revealTarget}
             />
           </div>
         )}
@@ -1277,11 +1197,7 @@ export default function ChatPage() {
                               Thinking...
                             </Shimmer>
                           ) : message.role === "assistant" ? (
-                            <AssistantMessageBody
-                              message={message}
-                              onRunClaims={() => loadClaims(message.id)}
-                              onClaimClick={handleClaimClick}
-                            />
+                            <AssistantMessageBody message={message} />
                           ) : (
                             <MessageResponse>{message.content}</MessageResponse>
                           )}
@@ -1364,13 +1280,6 @@ export default function ChatPage() {
           turnMeta={turnMetaRef.current}
           sessionId={getSessionId()}
           onClose={() => setProvenanceOpen(false)}
-        />
-      )}
-
-      {toolOutputTarget && (
-        <ToolOutputPopover
-          target={toolOutputTarget}
-          onClose={() => setToolOutputTarget(null)}
         />
       )}
 

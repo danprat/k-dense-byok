@@ -20,6 +20,72 @@ def custom_mcps_path() -> Path:
     return active_paths().custom_mcps_path
 
 
+def browser_use_config_path() -> Path:
+    """Return the browser-use config JSON path for the active project."""
+    return active_paths().browser_use_config_path
+
+
+DEFAULT_BROWSER_USE_CONFIG: dict = {
+    "enabled": True,
+    "headed": False,
+    "profile": None,
+    "session": None,
+}
+
+
+def load_browser_use_config() -> dict:
+    """Read the browser-use config for the active project.
+
+    Returns a dict with defaults filled in; missing/unparseable files
+    fall back to ``DEFAULT_BROWSER_USE_CONFIG``.
+    """
+    path = browser_use_config_path()
+    data: dict | None = None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            data = parsed
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = None
+
+    cfg = dict(DEFAULT_BROWSER_USE_CONFIG)
+    if data:
+        cfg.update({k: data[k] for k in DEFAULT_BROWSER_USE_CONFIG if k in data})
+    return cfg
+
+
+def save_browser_use_config(data: dict) -> None:
+    """Persist the browser-use config for the active project."""
+    cfg = dict(DEFAULT_BROWSER_USE_CONFIG)
+    cfg.update({k: data[k] for k in DEFAULT_BROWSER_USE_CONFIG if k in data})
+    path = browser_use_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def build_browser_use_mcp_spec() -> dict | None:
+    """Return a Gemini-CLI-style MCP server spec for browser-use.
+
+    Returns ``None`` when the feature is disabled in the project's
+    ``browser_use.json`` so callers can skip registration.
+    """
+    cfg = load_browser_use_config()
+    if not cfg.get("enabled", True):
+        return None
+
+    args: list[str] = ["browser-use"]
+    if cfg.get("headed"):
+        args.append("--headed")
+    profile = cfg.get("profile")
+    if profile:
+        args += ["--profile", str(profile)]
+    session = cfg.get("session")
+    if session:
+        args += ["--session", str(session)]
+    args.append("--mcp")
+    return {"command": "uvx", "args": args}
+
+
 def build_default_settings() -> dict:
     """Return the base Gemini CLI settings dict with built-in MCP servers."""
     settings: dict = {
@@ -48,6 +114,11 @@ def build_default_settings() -> dict:
             },
         },
     }
+
+    bu = build_browser_use_mcp_spec()
+    if bu is not None:
+        settings["mcpServers"]["browser-use"] = bu
+
     return settings
 
 

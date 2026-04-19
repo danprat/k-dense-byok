@@ -38,36 +38,6 @@ export interface CitationReport {
   loading?: boolean;
 }
 
-export type ClaimStatus = "verified" | "approximate" | "unbacked" | "ambiguous";
-
-export type ClaimSourceKind = "file" | "notebook" | "tool_output" | "none";
-
-export interface ClaimSource {
-  kind: ClaimSourceKind;
-  file?: string;
-  cell?: number;
-  line?: number;
-  value?: string;
-  note?: string;
-  delegationId?: string;
-  eventIndex?: number;
-}
-
-export interface ClaimEntry {
-  text: string;
-  context?: string;
-  status: ClaimStatus;
-  source?: ClaimSource;
-}
-
-export interface ClaimsReport {
-  turnId?: string;
-  scannedAt?: string;
-  claims: ClaimEntry[];
-  loading?: boolean;
-  error?: string;
-}
-
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -77,7 +47,6 @@ export interface ChatMessage {
   timestamp: number;
   turnId?: string;
   citations?: CitationReport;
-  claims?: ClaimsReport;
 }
 
 type Status = "ready" | "submitted" | "streaming" | "error";
@@ -171,77 +140,6 @@ export function useAgent() {
     const session = await res.json();
     sessionIdRef.current = session.id;
     return session.id as string;
-  }, []);
-
-  const loadClaims = useCallback(async (messageId: string) => {
-    const sessionId = sessionIdRef.current;
-    const snapshot = await new Promise<ChatMessage | undefined>((resolve) =>
-      setMessages((prev) => {
-        resolve(prev.find((m) => m.id === messageId));
-        return prev;
-      })
-    );
-    const turnId = snapshot?.turnId;
-    if (!sessionId || !turnId) return;
-
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId
-          ? { ...m, claims: { claims: [], loading: true } }
-          : m
-      )
-    );
-    try {
-      const resp = await apiFetch(
-        `/turns/${sessionId}/${turnId}/claims`
-      );
-      if (resp.status === 404) {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === messageId
-              ? {
-                  ...m,
-                  claims: {
-                    claims: [],
-                    error: "No claims.json for this turn. If the expert ran code, it should have emitted one.",
-                  },
-                }
-              : m
-          )
-        );
-        return;
-      }
-      if (!resp.ok) throw new Error(`claims ${resp.status}`);
-      const data = await resp.json();
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                claims: {
-                  turnId: data.turnId,
-                  scannedAt: data.scannedAt,
-                  claims: Array.isArray(data.claims) ? data.claims : [],
-                },
-              }
-            : m
-        )
-      );
-    } catch (exc) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId
-            ? {
-                ...m,
-                claims: {
-                  claims: [],
-                  error: exc instanceof Error ? exc.message : "Failed to load claims",
-                },
-              }
-            : m
-        )
-      );
-    }
   }, []);
 
   const send = useCallback(
@@ -509,7 +407,6 @@ export function useAgent() {
           }));
 
           let deliverables: string[] = [];
-          let producedCode = false;
           if (turnId && sessionIdRef.current) {
             try {
               const mResp = await apiFetch(
@@ -520,18 +417,10 @@ export function useAgent() {
                 if (Array.isArray(manifest?.output?.deliverables)) {
                   deliverables = manifest.output.deliverables;
                 }
-                producedCode = Boolean(manifest?.claims?.producedCode);
               }
             } catch {
               // best-effort
             }
-          }
-
-          // If any delegation in this turn ran code, auto-fire the claims
-          // fetch. The Audit numbers button stays available as a manual
-          // fallback for turns without code.
-          if (producedCode) {
-            void loadClaims(assistantId);
           }
 
           try {
@@ -609,7 +498,7 @@ export function useAgent() {
 
       return userMsgId;
     },
-    [status, ensureSession, loadClaims]
+    [status, ensureSession]
   );
 
   const stop = useCallback(() => {
@@ -630,5 +519,5 @@ export function useAgent() {
 
   const getSessionId = useCallback(() => sessionIdRef.current, []);
 
-  return { messages, status, send, stop, reset, getSessionId, loadClaims };
+  return { messages, status, send, stop, reset, getSessionId };
 }

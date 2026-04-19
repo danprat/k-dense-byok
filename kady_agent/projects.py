@@ -84,6 +84,7 @@ class ProjectPaths:
     citation_cache: Path
     gemini_settings_dir: Path
     custom_mcps_path: Path
+    browser_use_config_path: Path
     sessions_db_path: Path
 
 
@@ -140,6 +141,7 @@ def resolve_paths(project_id: str) -> ProjectPaths:
         citation_cache=kady_dir / "citation-cache.json",
         gemini_settings_dir=sandbox / ".gemini",
         custom_mcps_path=root / "custom_mcps.json",
+        browser_use_config_path=root / "browser_use.json",
         sessions_db_path=root / "sessions.db",
     )
 

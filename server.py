@@ -37,7 +37,9 @@ from kady_agent.anndata_preview import (
 )
 from kady_agent.citations import report_to_dict, verify_text_and_files
 from kady_agent.gemini_settings import (
+    load_browser_use_config,
     load_custom_mcps,
+    save_browser_use_config,
     save_custom_mcps,
     write_merged_settings,
 )
@@ -257,6 +259,52 @@ async def put_custom_mcps(request: Request):
     return {"ok": True}
 
 
+@app.get("/settings/browser-use")
+def get_browser_use_settings():
+    """Return the active project's browser-use config."""
+    return {"config": load_browser_use_config()}
+
+
+@app.get("/system/chrome-profiles")
+def get_chrome_profiles():
+    """Return Chrome profiles detected on this machine.
+
+    The UI uses these to let the user pick which real Chrome profile the
+    browser-use agent should attach to (so it inherits logins/cookies).
+    """
+    from kady_agent.chrome_profiles import detect_chrome_profiles
+
+    return {"profiles": [p.to_dict() for p in detect_chrome_profiles()]}
+
+
+@app.put("/settings/browser-use")
+async def put_browser_use_settings(request: Request):
+    """Save the browser-use config and rebuild merged Gemini CLI settings."""
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+
+    cfg = load_browser_use_config()
+    if "enabled" in data:
+        cfg["enabled"] = bool(data["enabled"])
+    if "headed" in data:
+        cfg["headed"] = bool(data["headed"])
+    if "profile" in data:
+        p = data["profile"]
+        cfg["profile"] = (str(p).strip() or None) if p is not None else None
+    if "session" in data:
+        s = data["session"]
+        cfg["session"] = (str(s).strip() or None) if s is not None else None
+
+    save_browser_use_config(cfg)
+    write_merged_settings(active_paths().gemini_settings_dir)
+    touch_project(ACTIVE_PROJECT.get())
+    return {"ok": True, "config": load_browser_use_config()}
+
+
 @app.get("/turns/{session_id}/{turn_id}/manifest")
 async def get_turn_manifest(session_id: str, turn_id: str):
     """Return the per-turn run manifest written by kady_agent/manifest.py.
@@ -319,73 +367,6 @@ async def replay_turns_endpoint(request: Request):
             ACTIVE_PROJECT.reset(token)
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
-
-
-@app.get("/turns/{session_id}/{turn_id}/claims")
-async def get_turn_claims(session_id: str, turn_id: str):
-    """Return the claims.json written by the Quantitative claims auditor.
-
-    The auditor is a delegated reviewer (see main_agent.md) that writes a
-    structured list of numeric claims and the exact file/line they were
-    derived from. The UI uses this to render red dotted underlines on
-    unbacked numbers.
-    """
-    runs_dir = active_paths().runs_dir
-    claims_path = runs_dir / session_id / turn_id / "claims.json"
-    if not claims_path.is_file():
-        expert_root = runs_dir / session_id / turn_id / "expert"
-        if expert_root.is_dir():
-            for sub in sorted(expert_root.iterdir()):
-                candidate = sub / "claims.json"
-                if candidate.is_file():
-                    claims_path = candidate
-                    break
-    if not claims_path.is_file():
-        raise HTTPException(status_code=404, detail="claims.json not found")
-    try:
-        data = json.loads(claims_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read claims: {exc}")
-    return data
-
-
-@app.get("/turns/{session_id}/{turn_id}/expert/{delegation_id}/stdout")
-async def get_expert_stdout_event(
-    session_id: str,
-    turn_id: str,
-    delegation_id: str,
-    eventIndex: int = Query(...),
-):
-    """Return a single event from an expert delegation's ``stdout.jsonl``.
-
-    Used by the chat-UI ``ToolOutputPopover`` when a user clicks a claim
-    whose source is ``{kind: "tool_output", delegationId, eventIndex}``.
-    We only ever send one event so payloads stay tiny regardless of how
-    chatty the expert was.
-    """
-    if eventIndex < 0:
-        raise HTTPException(status_code=400, detail="eventIndex must be >= 0")
-    stdout_path = (
-        active_paths().runs_dir / session_id / turn_id / "expert" / delegation_id / "stdout.jsonl"
-    )
-    if not stdout_path.is_file():
-        raise HTTPException(status_code=404, detail="stdout.jsonl not found")
-    try:
-        with stdout_path.open("r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i != eventIndex:
-                    continue
-                line = line.strip()
-                if not line:
-                    raise HTTPException(status_code=404, detail="Empty event")
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    return {"eventIndex": eventIndex, "raw": line}
-                return {"eventIndex": eventIndex, "event": event}
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read stdout: {exc}")
-    raise HTTPException(status_code=404, detail="eventIndex out of range")
 
 
 @app.patch("/turns/{session_id}/{turn_id}/citations")

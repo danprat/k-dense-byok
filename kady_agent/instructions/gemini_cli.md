@@ -193,91 +193,9 @@ cat > .kady/expert/$KADY_DELEGATION_ID/deliverables.json <<'EOF'
 EOF
 ```
 
-### Step 4 — Write `claims.json` (required when you produced code)
-
-Whenever your reply contains **any user-facing numbers** and you ran code, wrote files, or executed shell commands in this delegation, you **must** emit a `claims.json` file at:
-
-```
-.kady/expert/$KADY_DELEGATION_ID/claims.json
-```
-
-listing **every** number that will appear in the reply the user reads — percentages, p-values, counts, ratios, sample sizes, durations, dollar amounts, effect sizes, accuracies, loss values, table cells rephrased in prose. Each entry points to the exact source that produced the number. The UI underlines these numbers in the chat panel; numbers without a backing source render with a red underline.
-
-**Schema** (write a JSON object with a `claims` array):
-
-```json
-{
-  "turnId": "$KADY_TURN_ID",
-  "scannedAt": "<ISO8601 UTC>",
-  "claims": [
-    {
-      "text": "p = 0.03",
-      "context": "shortest surrounding sentence from your reply",
-      "status": "verified",
-      "source": {
-        "kind": "file",
-        "file": "report/analysis.py",
-        "line": 42,
-        "value": "0.0284"
-      }
-    },
-    {
-      "text": "42",
-      "context": "We processed 42 samples.",
-      "status": "verified",
-      "source": {
-        "kind": "notebook",
-        "file": "analysis.ipynb",
-        "cell": 3,
-        "line": 12,
-        "value": "42"
-      }
-    },
-    {
-      "text": "1.7x speedup",
-      "context": "This yielded a 1.7x speedup.",
-      "status": "approximate",
-      "source": {
-        "kind": "tool_output",
-        "delegationId": "$KADY_DELEGATION_ID",
-        "eventIndex": 17,
-        "value": "1.73"
-      }
-    },
-    {
-      "text": "roughly a third",
-      "context": "Roughly a third of reads mapped.",
-      "status": "unbacked",
-      "source": { "kind": "none" }
-    }
-  ]
-}
-```
-
-**Source kinds:**
-
-- `file` — a plain source file and line number you wrote or read. `file` is a sandbox-relative path.
-- `notebook` — a cell in a `.ipynb` you wrote. `cell` is the 0-based cell index; `line` is the 0-based line inside that cell's source.
-- `tool_output` — a specific event in **your own** stream-json stdout. `delegationId` should be `$KADY_DELEGATION_ID`; `eventIndex` is the 0-based index of the event in `stdout.jsonl` (e.g. the `tool_use` or `tool_result` line whose output carries the number).
-- `none` — no traceable source. Use with `status: "unbacked"`.
-
-**Status values:**
-
-- `verified` — the number in your reply matches the source value exactly (or within a sensible rounding that preserves all reported significant figures).
-- `approximate` — the reply rounds or rephrases the source value; include the literal source value under `source.value`.
-- `ambiguous` — you are not sure which of several candidate sources produced the number.
-- `unbacked` — you asserted the number without a traceable source. Do **not** guess a source — record `"kind": "none"`.
-
-**Rules:**
-
-1. List **every** user-facing number, including approximations and unbacked ones. The frontend will render exactly what you declare.
-2. `text` must be an **exact substring** of your assistant reply; the UI finds and underlines it by substring match.
-3. Do not list numbers that appear only inside code fences in your reply — the UI skips those.
-4. If you produced no code and no numbers, you may skip this step.
-
 ### Failure mode
 
-If you skip these steps, the manifest records `envLockPath: null` for your delegation and the methods paragraph will note "(env lock unavailable for delegation X)." If you produced code but skipped `claims.json`, every number in your reply will render with a red underline in the chat UI, signalling to the user that the numbers are unbacked. Either outcome degrades reviewer trust and is not acceptable for any task involving computation or sampling.
+If you skip these steps, the manifest records `envLockPath: null` for your delegation and the methods paragraph will note "(env lock unavailable for delegation X)." This degrades reviewer trust and is not acceptable for any task involving computation or sampling.
 
 </PROTOCOL:REPRODUCIBILITY>
 

@@ -184,7 +184,6 @@ export interface RunManifest {
     durationMs: number;
   };
   citations?: { total: number; verified: number; unresolved: number } | null;
-  claims?: { total: number; verified: number; unbacked: number } | null;
   manifestSha256?: string;
 }
 

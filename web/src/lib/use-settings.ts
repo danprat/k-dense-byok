@@ -80,3 +80,137 @@ export function useCustomMcps(): UseCustomMcpsReturn {
 
   return { value, loading, saving, error, save, refresh: fetchMcps };
 }
+
+export interface BrowserUseConfig {
+  enabled: boolean;
+  headed: boolean;
+  profile: string | null;
+  session: string | null;
+}
+
+export const DEFAULT_BROWSER_USE_CONFIG: BrowserUseConfig = {
+  enabled: true,
+  headed: false,
+  profile: null,
+  session: null,
+};
+
+export interface UseBrowserUseSettingsReturn {
+  config: BrowserUseConfig;
+  loading: boolean;
+  saving: boolean;
+  error: string | null;
+  save: (patch: Partial<BrowserUseConfig>) => Promise<boolean>;
+  refresh: () => void;
+}
+
+export function useBrowserUseSettings(): UseBrowserUseSettingsReturn {
+  const [config, setConfig] = useState<BrowserUseConfig>(
+    DEFAULT_BROWSER_USE_CONFIG,
+  );
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchConfig = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    apiFetch(`/settings/browser-use`)
+      .then((r) =>
+        r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)),
+      )
+      .then((data: { config?: Partial<BrowserUseConfig> }) => {
+        setConfig({ ...DEFAULT_BROWSER_USE_CONFIG, ...(data.config ?? {}) });
+      })
+      .catch((e) => setError(e.message ?? "Failed to load"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    fetchConfig();
+  }, [fetchConfig]);
+
+  useEffect(() => onProjectChange(() => fetchConfig()), [fetchConfig]);
+
+  const save = useCallback(
+    async (patch: Partial<BrowserUseConfig>): Promise<boolean> => {
+      setError(null);
+      setSaving(true);
+      const next: BrowserUseConfig = { ...config, ...patch };
+      try {
+        const res = await apiFetch(`/settings/browser-use`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(next),
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(detail || `HTTP ${res.status}`);
+        }
+        const data: { config?: Partial<BrowserUseConfig> } = await res
+          .json()
+          .catch(() => ({}));
+        setConfig({ ...DEFAULT_BROWSER_USE_CONFIG, ...(data.config ?? next) });
+        return true;
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : "Save failed");
+        return false;
+      } finally {
+        setSaving(false);
+      }
+    },
+    [config],
+  );
+
+  return { config, loading, saving, error, save, refresh: fetchConfig };
+}
+
+export interface ChromeProfile {
+  /** Directory name under Chrome's user-data dir (passed to --profile). */
+  id: string;
+  /** Display name shown in Chrome (falls back to the directory name). */
+  name: string;
+  /** Google account email when signed-in; null otherwise. */
+  email: string | null;
+  /** Absolute path to the profile directory on disk. */
+  path: string;
+}
+
+export interface UseChromeProfilesReturn {
+  profiles: ChromeProfile[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+}
+
+/**
+ * Fetch Chrome profiles installed on the user's machine.
+ *
+ * Returns an empty array when Chrome isn't installed. The list is
+ * machine-scoped, so no project-change refetch is needed.
+ */
+export function useChromeProfiles(): UseChromeProfilesReturn {
+  const [profiles, setProfiles] = useState<ChromeProfile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchProfiles = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    apiFetch(`/system/chrome-profiles`)
+      .then((r) =>
+        r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)),
+      )
+      .then((data: { profiles?: ChromeProfile[] }) => {
+        setProfiles(Array.isArray(data.profiles) ? data.profiles : []);
+      })
+      .catch((e) => setError(e.message ?? "Failed to load"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    fetchProfiles();
+  }, [fetchProfiles]);
+
+  return { profiles, loading, error, refresh: fetchProfiles };
+}

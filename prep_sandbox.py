@@ -16,6 +16,9 @@ dependency is added to the sandbox pyproject template.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 from kady_agent.projects import (
     DEFAULT_PROJECT_ID,
     ensure_project_exists,
@@ -24,11 +27,44 @@ from kady_agent.projects import (
     migrate_legacy_layout,
 )
 
+REPO_ROOT = Path(__file__).resolve().parent
+BROWSER_USE_MARKER = REPO_ROOT / ".venv" / ".browser-use-installed"
+
+
+def install_browser_use_chromium() -> None:
+    """Ensure browser-use's bundled Chromium is present (idempotent).
+
+    The browser-use CLI spawns its own Chromium under ``~/.browser-use/``.
+    Downloading it lazily on first MCP call causes a noticeable stall the
+    first time the agent reaches for a browser tool, so we pre-fetch it as
+    part of the normal sandbox prep. Guarded by a marker file so the check
+    is a single ``exists()`` call on subsequent runs.
+    """
+    if BROWSER_USE_MARKER.is_file():
+        return
+    print("Installing browser-use Chromium (first-run only)...")
+    try:
+        subprocess.run(
+            ["uvx", "browser-use", "install"],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"  warning: `uvx browser-use install` failed: {exc}")
+        print("  browser automation will try to install Chromium on first use.")
+        return
+    try:
+        BROWSER_USE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        BROWSER_USE_MARKER.touch()
+    except OSError:
+        pass
+
 
 def main() -> None:
     migrated = migrate_legacy_layout()
     if migrated:
         print("Migrated legacy sandbox/ + user_config/ into projects/default/.")
+
+    install_browser_use_chromium()
 
     # Guarantee the default project exists even on a fresh checkout where
     # there was no legacy layout to migrate.

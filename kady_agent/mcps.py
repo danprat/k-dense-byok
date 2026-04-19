@@ -13,7 +13,7 @@ from google.adk.tools.mcp_tool.mcp_session_manager import (
     StreamableHTTPConnectionParams,
 )
 
-from .gemini_settings import load_custom_mcps
+from .gemini_settings import build_browser_use_mcp_spec, load_custom_mcps
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,49 @@ class DynamicCustomMcpToolset(BaseToolset):
         self._toolsets.clear()
 
 
+class DynamicBuiltinBrowserUseToolset(BaseToolset):
+    """Built-in browser-use MCP that reloads when its per-project config
+    changes between turns.
+
+    Mirrors ``DynamicCustomMcpToolset``: reads ``browser_use.json`` on each
+    call, tears down and rebuilds the underlying MCP connection only when
+    the spec hash changes, and returns an empty tool list when the feature
+    is disabled.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._toolset: ResilientMcpToolset | None = None
+        self._spec_hash: str | None = None
+
+    async def get_tools(
+        self, readonly_context: Optional[ReadonlyContext] = None
+    ) -> List[BaseTool]:
+        spec = build_browser_use_mcp_spec()
+        new_hash = json.dumps(spec, sort_keys=True) if spec is not None else ""
+
+        if new_hash != self._spec_hash:
+            await self._rebuild(spec)
+            self._spec_hash = new_hash
+
+        if self._toolset is None:
+            return []
+        return await self._toolset.get_tools(readonly_context)
+
+    async def _rebuild(self, spec: dict | None) -> None:
+        if self._toolset is not None:
+            await self._toolset.close()
+            self._toolset = None
+        if spec is None:
+            return
+        self._toolset = _make_toolset("Browser Use MCP", spec)
+
+    async def close(self) -> None:
+        if self._toolset is not None:
+            await self._toolset.close()
+            self._toolset = None
+
+
 # ---------------------------------------------------------------------------
 # Built-in MCP servers
 # ---------------------------------------------------------------------------
@@ -151,6 +194,10 @@ docling_mcp = ResilientMcpToolset(
     label="Docling MCP",
 )
 all_mcps.append(docling_mcp)
+
+# Browser automation via the browser-use CLI (loaded dynamically per-request
+# so the Settings tab / input-bar chip hot-reload without a server restart).
+all_mcps.append(DynamicBuiltinBrowserUseToolset())
 
 # User-configured custom MCP servers (loaded dynamically per-request)
 all_mcps.append(DynamicCustomMcpToolset())

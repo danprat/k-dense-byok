@@ -8,7 +8,6 @@ from typing import Optional
 from dotenv import load_dotenv
 from google.adk.tools.tool_context import ToolContext
 
-from ..claims import load_expert_claims, produced_code
 from ..manifest import (
     attach_delegation,
     session_seed,
@@ -247,15 +246,9 @@ async def delegate_task(
     if session_id and turn_id and delegation_id:
         env_lock: str | None = None
         deliverables: list[str] | None = None
-        claim_entries: list[dict] = []
         kady_dir = cwd / ".kady"
         if kady_dir.is_dir():
             env_lock, deliverables = _collect_expert_artifacts(kady_dir, delegation_id)
-            claim_entries = load_expert_claims(
-                kady_dir / "expert" / delegation_id / "claims.json",
-                delegation_id=delegation_id,
-            )
-        did_produce_code = produced_code(result, env_lock)
         try:
             # Also mirror the delegation dir into the run-level manifest tree so
             # the expert's stdout is reachable by turnId (not just by cwd).
@@ -272,8 +265,6 @@ async def delegate_task(
                 stdout=raw,
                 env_lock=env_lock,
                 deliverables=deliverables,
-                claims=claim_entries,
-                produced_code=did_produce_code,
             )
         except Exception:
             pass
