@@ -23,7 +23,10 @@ from .utils import (
 
 load_dotenv()
 
-DEFAULT_MODEL = os.getenv("DEFAULT_AGENT_MODEL")
+DEFAULT_MODEL = (
+    os.getenv("DEFAULT_AGENT_MODEL")
+    or "openrouter/anthropic/claude-opus-4.7"
+)
 # Separate default for the Gemini CLI expert subprocess. The expert is a
 # tool-heavy CLI agent, so we recommend Gemini 3.1 Pro (native tool calling +
 # 1M-token context) rather than the orchestrator's Claude Opus default. Users
