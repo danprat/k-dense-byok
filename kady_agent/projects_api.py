@@ -15,6 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
+from .cost_ledger import check_project_budget, read_project_costs
 from .projects import (
     DEFAULT_PROJECT_ID,
     create_project,
@@ -55,6 +56,7 @@ class ProjectCreateBody(BaseModel):
     description: Optional[str] = ""
     tags: Optional[list[str]] = Field(default_factory=list)
     id: Optional[str] = None  # let callers pin a slug, otherwise we mint one
+    spendLimitUsd: Optional[float] = None
 
 
 class ProjectPatchBody(BaseModel):
@@ -62,6 +64,10 @@ class ProjectPatchBody(BaseModel):
     description: Optional[str] = None
     tags: Optional[list[str]] = None
     archived: Optional[bool] = None
+    # ``None`` means "clear the cap" (unlimited). We rely on Pydantic's
+    # ``model_fields_set`` to distinguish "field omitted" from "field = null"
+    # when forwarding the patch to update_project.
+    spendLimitUsd: Optional[float] = None
 
 
 class SandboxInitBody(BaseModel):
@@ -90,6 +96,7 @@ def post_project(body: ProjectCreateBody, background_tasks: BackgroundTasks):
             description=body.description or "",
             tags=body.tags or [],
             project_id=body.id,
+            spend_limit_usd=body.spendLimitUsd,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -110,14 +117,19 @@ def get_one_project(project_id: str):
 
 @projects_router.patch("/{project_id}")
 def patch_project(project_id: str, body: ProjectPatchBody):
+    # Pass through spendLimitUsd only if the caller actually included it in the
+    # payload (vs Pydantic filling in the default None). update_project uses a
+    # sentinel to distinguish "omit" from "clear to unlimited".
+    kwargs: dict = {
+        "name": body.name,
+        "description": body.description,
+        "tags": body.tags,
+        "archived": body.archived,
+    }
+    if "spendLimitUsd" in body.model_fields_set:
+        kwargs["spend_limit_usd"] = body.spendLimitUsd
     try:
-        meta = update_project(
-            project_id,
-            name=body.name,
-            description=body.description,
-            tags=body.tags,
-            archived=body.archived,
-        )
+        meta = update_project(project_id, **kwargs)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project not found")
     except ValueError as exc:
@@ -139,6 +151,24 @@ def delete_one_project(project_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return None
+
+
+@projects_router.get("/{project_id}/costs")
+def get_project_cost_summary(project_id: str):
+    """Return cumulative cost across every session in a project.
+
+    Also echoes the project's current ``spendLimitUsd`` and a pre-classified
+    budget ``state`` (ok / warn / exceeded) so the UI can render both the
+    number and the progress bar in a single request.
+    """
+    meta = get_project(project_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    summary = read_project_costs(project_id)
+    budget = check_project_budget(project_id, meta.spendLimitUsd)
+    summary["limitUsd"] = meta.spendLimitUsd
+    summary["budget"] = budget
+    return summary
 
 
 @projects_router.post("/{project_id}/sandbox/init")

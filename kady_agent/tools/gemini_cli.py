@@ -8,11 +8,12 @@ from typing import Optional
 from dotenv import load_dotenv
 from google.adk.tools.tool_context import ToolContext
 
+from ..cost_ledger import check_project_budget
 from ..manifest import (
     attach_delegation,
     session_seed,
 )
-from ..projects import active_paths
+from ..projects import active_paths, get_project
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -142,6 +143,32 @@ async def delegate_task(
     prev_headers = env.get("GEMINI_CLI_CUSTOM_HEADERS", "").strip()
 
     paths = active_paths()
+
+    # Hard spend cap: if the project has a spendLimitUsd set and the cumulative
+    # cost across every session already equals or exceeds it, refuse to launch
+    # the expert. Returning a tool result (rather than raising) lets the
+    # orchestrator surface a clean, user-facing explanation and still close
+    # the turn normally.
+    project_meta = get_project(paths.id)
+    if project_meta is not None and project_meta.spendLimitUsd is not None:
+        budget = check_project_budget(paths.id, project_meta.spendLimitUsd)
+        if budget["state"] == "exceeded":
+            limit = float(budget["limitUsd"] or 0.0)
+            spent = float(budget["totalUsd"] or 0.0)
+            return {
+                "result": (
+                    f"Delegation blocked: project '{project_meta.name}' has "
+                    f"reached its spend limit (${spent:.2f} / ${limit:.2f}). "
+                    f"Raise the limit in the project settings and retry."
+                ),
+                "skills_used": [],
+                "tools_used": {},
+                "budgetBlocked": True,
+                "projectId": paths.id,
+                "totalUsd": spent,
+                "limitUsd": limit,
+            }
+
     # Some models (e.g. GPT-5.4 Nano) pass `working_directory="."` or other
     # relative paths when they shouldn't. Treat any relative path as being
     # relative to the project's sandbox, not the repo root — the sandbox IS

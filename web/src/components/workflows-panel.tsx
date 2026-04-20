@@ -287,6 +287,7 @@ function LaunchDialog({
   onLaunch,
   onUploadFiles,
   modalConfigured,
+  budgetBlocked = false,
 }: {
   workflow: Workflow;
   open: boolean;
@@ -294,6 +295,7 @@ function LaunchDialog({
   onLaunch: (prompt: string, model: Model, compute: ModalInstance | null, suggestedSkills: string[], uploadedFiles: string[]) => void;
   onUploadFiles?: (files: FileList | File[], paths?: string[]) => Promise<string[]>;
   modalConfigured: boolean;
+  budgetBlocked?: boolean;
 }) {
   const [model, setModel] = useState<Model>(DEFAULT_MODEL);
   const [compute, setCompute] = useState<ModalInstance | null>(null);
@@ -504,7 +506,16 @@ function LaunchDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={handleLaunch} disabled={!canLaunch} className="gap-1.5">
+          <Button
+            onClick={handleLaunch}
+            disabled={!canLaunch || budgetBlocked}
+            title={
+              budgetBlocked
+                ? "Project spend limit reached. Raise the limit in the project settings to continue."
+                : undefined
+            }
+            className="gap-1.5"
+          >
             <PlayIcon className="size-3.5" />
             Run workflow
           </Button>
@@ -518,10 +529,12 @@ export function WorkflowsPanel({
   onLaunch,
   onUploadFiles,
   modalConfigured,
+  budgetBlocked = false,
 }: {
   onLaunch: (prompt: string, model: Model, compute: ModalInstance | null, suggestedSkills: string[], uploadedFiles: string[]) => void;
   onUploadFiles?: (files: FileList | File[], paths?: string[]) => Promise<string[]>;
   modalConfigured: boolean;
+  budgetBlocked?: boolean;
 }) {
   const [selectedWorkflow, setSelectedWorkflow] = useState<Workflow | null>(null);
   const [search, setSearch] = useState("");
@@ -655,6 +668,7 @@ export function WorkflowsPanel({
           onLaunch={onLaunch}
           onUploadFiles={onUploadFiles}
           modalConfigured={modalConfigured}
+          budgetBlocked={budgetBlocked}
         />
       )}
     </div>

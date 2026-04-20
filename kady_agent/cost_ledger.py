@@ -259,6 +259,121 @@ def update_cost_entry(
     return True
 
 
+def _empty_project_summary(project_id: str) -> dict[str, Any]:
+    return {
+        "projectId": project_id,
+        "totalUsd": 0.0,
+        "orchestratorUsd": 0.0,
+        "expertUsd": 0.0,
+        "totalTokens": 0,
+        "orchestratorTokens": 0,
+        "expertTokens": 0,
+        "sessionCount": 0,
+        "hasPending": False,
+        "bySession": {},
+    }
+
+
+def read_project_costs(project_id: str) -> dict[str, Any]:
+    """Aggregate every session's ``costs.jsonl`` under one project.
+
+    Walks ``<project>/sandbox/.kady/runs/<sessionId>/costs.jsonl`` for every
+    session directory. ``entryId``-level rows are not echoed back (the
+    session endpoint does that per-session); instead the caller gets a
+    compact ``bySession`` map keyed by session id for any UI that wants
+    to drill down.
+    """
+    summary = _empty_project_summary(project_id or "")
+    try:
+        paths = resolve_paths(project_id or "")
+    except (OSError, ValueError):
+        return summary
+    if not paths.runs_dir.is_dir():
+        return summary
+
+    session_ids: list[str] = []
+    try:
+        for child in paths.runs_dir.iterdir():
+            if child.is_dir() and (child / "costs.jsonl").is_file():
+                session_ids.append(child.name)
+    except OSError as exc:
+        logger.warning("Failed to list runs dir %s: %s", paths.runs_dir, exc)
+        return summary
+
+    by_session: dict[str, dict[str, Any]] = {}
+    any_pending = False
+    for sid in session_ids:
+        session_summary = read_costs(sid, project_id=project_id)
+        total_usd = float(session_summary.get("totalUsd") or 0.0)
+        total_tokens = int(session_summary.get("totalTokens") or 0)
+        orch_usd = float(session_summary.get("orchestratorUsd") or 0.0)
+        orch_tok = int(session_summary.get("orchestratorTokens") or 0)
+        exp_usd = float(session_summary.get("expertUsd") or 0.0)
+        exp_tok = int(session_summary.get("expertTokens") or 0)
+        pending = any(
+            bool(e.get("costPending")) for e in session_summary.get("entries", [])
+        )
+        if pending:
+            any_pending = True
+        if total_usd == 0.0 and total_tokens == 0 and not pending:
+            # Skip sessions that never produced a cost row (e.g. Ollama-only
+            # or orphan dirs). They'd still inflate sessionCount otherwise.
+            continue
+        by_session[sid] = {
+            "sessionId": sid,
+            "totalUsd": total_usd,
+            "totalTokens": total_tokens,
+            "orchestratorUsd": orch_usd,
+            "expertUsd": exp_usd,
+            "hasPending": pending,
+        }
+        summary["totalUsd"] += total_usd
+        summary["totalTokens"] += total_tokens
+        summary["orchestratorUsd"] += orch_usd
+        summary["orchestratorTokens"] += orch_tok
+        summary["expertUsd"] += exp_usd
+        summary["expertTokens"] += exp_tok
+
+    summary["sessionCount"] = len(by_session)
+    summary["bySession"] = by_session
+    summary["hasPending"] = any_pending
+    return summary
+
+
+def check_project_budget(
+    project_id: str, limit_usd: Optional[float]
+) -> dict[str, Any]:
+    """Classify a project's current spend against a hard cap.
+
+    ``state`` is one of ``"ok"`` (< 80% of limit, or no limit set),
+    ``"warn"`` (>= 80% and < 100%), or ``"exceeded"`` (>= 100%). ``ratio``
+    is ``totalUsd / limitUsd`` when a limit is set and otherwise ``None``
+    so the UI can render "proj $X.XX" without a denominator.
+    """
+    project_summary = read_project_costs(project_id)
+    total = float(project_summary.get("totalUsd") or 0.0)
+    if limit_usd is None or limit_usd <= 0:
+        return {
+            "totalUsd": total,
+            "limitUsd": None,
+            "ratio": None,
+            "state": "ok",
+        }
+    ratio = total / float(limit_usd)
+    if ratio >= 1.0:
+        state = "exceeded"
+    elif ratio >= 0.8:
+        state = "warn"
+    else:
+        state = "ok"
+    return {
+        "totalUsd": total,
+        "limitUsd": float(limit_usd),
+        "ratio": ratio,
+        "state": state,
+    }
+
+
 def _empty_summary(session_id: str) -> dict[str, Any]:
     return {
         "sessionId": session_id,
@@ -347,8 +462,10 @@ def read_costs(session_id: str, project_id: Optional[str] = None) -> dict[str, A
 
 
 __all__ = [
+    "check_project_budget",
     "extract_cost_tags",
     "read_costs",
+    "read_project_costs",
     "record_cost",
     "update_cost_entry",
 ]

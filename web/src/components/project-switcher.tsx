@@ -45,6 +45,9 @@ interface ProjectFormState {
   name: string;
   description: string;
   tags: string;
+  // Empty string = no limit (unlimited). Stored as a string so the input
+  // behaves naturally while the user is typing "0." / "1." etc.
+  spendLimit: string;
 }
 
 const EMPTY_FORM: ProjectFormState = {
@@ -54,6 +57,7 @@ const EMPTY_FORM: ProjectFormState = {
   name: "",
   description: "",
   tags: "",
+  spendLimit: "",
 };
 
 /** Display a project ID in Title Case when we haven't loaded the project
@@ -106,6 +110,10 @@ export function ProjectSwitcher() {
       name: project.name,
       description: project.description,
       tags: project.tags.join(", "),
+      spendLimit:
+        project.spendLimitUsd === null || project.spendLimitUsd === undefined
+          ? ""
+          : String(project.spendLimitUsd),
     });
     setFormError(null);
     setPopoverOpen(false);
@@ -116,6 +124,18 @@ export function ProjectSwitcher() {
     if (!form.name.trim()) {
       setFormError("Name is required");
       return;
+    }
+    // Parse spend limit: empty string = clear to unlimited. Any non-numeric
+    // or negative value is a user error.
+    const trimmedLimit = form.spendLimit.trim();
+    let spendLimitUsd: number | null = null;
+    if (trimmedLimit !== "") {
+      const parsed = Number(trimmedLimit);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        setFormError("Spend limit must be a non-negative number (or empty)");
+        return;
+      }
+      spendLimitUsd = parsed;
     }
     setSubmitting(true);
     try {
@@ -128,6 +148,7 @@ export function ProjectSwitcher() {
           name: form.name.trim(),
           description: form.description.trim(),
           tags,
+          spendLimitUsd,
         });
         setActive(project.id);
       } else if (form.id) {
@@ -135,6 +156,7 @@ export function ProjectSwitcher() {
           name: form.name.trim(),
           description: form.description.trim(),
           tags,
+          spendLimitUsd,
         });
       }
       setForm(EMPTY_FORM);
@@ -318,6 +340,27 @@ export function ProjectSwitcher() {
                 }
                 placeholder="genomics, proteomics"
               />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Spend limit <span className="opacity-50">(USD, optional)</span>
+              </label>
+              <Input
+                type="number"
+                inputMode="decimal"
+                min={0}
+                step="0.01"
+                value={form.spendLimit}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, spendLimit: e.target.value }))
+                }
+                placeholder="Leave empty for no limit"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Cumulative cost across every session. New delegations are
+                blocked once the total reaches this cap; a warning shows at
+                80%.
+              </p>
             </div>
             {formError && (
               <p className="text-xs text-destructive">{formError}</p>

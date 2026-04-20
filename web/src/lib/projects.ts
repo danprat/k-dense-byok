@@ -22,6 +22,7 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   archived: boolean;
+  spendLimitUsd: number | null;
 }
 
 export interface ProjectCreateInput {
@@ -29,6 +30,7 @@ export interface ProjectCreateInput {
   description?: string;
   tags?: string[];
   id?: string;
+  spendLimitUsd?: number | null;
 }
 
 export interface ProjectPatchInput {
@@ -36,6 +38,7 @@ export interface ProjectPatchInput {
   description?: string;
   tags?: string[];
   archived?: boolean;
+  spendLimitUsd?: number | null;
 }
 
 export const DEFAULT_PROJECT_ID = "default";

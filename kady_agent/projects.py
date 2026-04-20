@@ -52,12 +52,25 @@ class ProjectMeta:
     createdAt: str = ""
     updatedAt: str = ""
     archived: bool = False
+    # Hard USD cap on cumulative cost across every session in this project.
+    # ``None`` means "unlimited" and is the default for existing projects
+    # that predate the feature.
+    spendLimitUsd: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "ProjectMeta":
+        raw_limit = data.get("spendLimitUsd")
+        spend_limit: Optional[float]
+        if raw_limit is None or raw_limit == "":
+            spend_limit = None
+        else:
+            try:
+                spend_limit = float(raw_limit)
+            except (TypeError, ValueError):
+                spend_limit = None
         return cls(
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
@@ -66,6 +79,7 @@ class ProjectMeta:
             createdAt=str(data.get("createdAt", "")),
             updatedAt=str(data.get("updatedAt", "")),
             archived=bool(data.get("archived", False)),
+            spendLimitUsd=spend_limit,
         )
 
 
@@ -294,6 +308,7 @@ def create_project(
     description: str = "",
     tags: Optional[Iterable[str]] = None,
     project_id: Optional[str] = None,
+    spend_limit_usd: Optional[float] = None,
 ) -> ProjectMeta:
     """Create the on-disk skeleton and registry entry for a new project.
 
@@ -314,6 +329,15 @@ def create_project(
         raise ValueError(f"Project already exists: {project_id}")
 
     now = _now_iso()
+    validated_limit: Optional[float] = None
+    if spend_limit_usd is not None:
+        try:
+            value = float(spend_limit_usd)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("spendLimitUsd must be a number or null") from exc
+        if value < 0:
+            raise ValueError("spendLimitUsd must be >= 0")
+        validated_limit = value
     meta = ProjectMeta(
         id=project_id,
         name=name,
@@ -322,6 +346,7 @@ def create_project(
         createdAt=now,
         updatedAt=now,
         archived=False,
+        spendLimitUsd=validated_limit,
     )
     paths.root.mkdir(parents=True, exist_ok=True)
     paths.sandbox.mkdir(parents=True, exist_ok=True)
@@ -337,6 +362,12 @@ def create_project(
     return meta
 
 
+# Sentinel used to distinguish "field not provided" from "explicitly set to None"
+# in update_project. We need this because ``spendLimitUsd=None`` is a meaningful
+# value (clear the cap) that is not the same as "leave the existing cap alone".
+_UNSET: Any = object()
+
+
 def update_project(
     project_id: str,
     *,
@@ -344,6 +375,7 @@ def update_project(
     description: Optional[str] = None,
     tags: Optional[Iterable[str]] = None,
     archived: Optional[bool] = None,
+    spend_limit_usd: Any = _UNSET,
 ) -> ProjectMeta:
     meta = get_project(project_id)
     if meta is None:
@@ -356,6 +388,19 @@ def update_project(
         meta.tags = [t.strip() for t in tags if t and t.strip()]
     if archived is not None:
         meta.archived = bool(archived)
+    if spend_limit_usd is not _UNSET:
+        if spend_limit_usd is None:
+            meta.spendLimitUsd = None
+        else:
+            try:
+                value = float(spend_limit_usd)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"spendLimitUsd must be a number or null, got {spend_limit_usd!r}"
+                ) from exc
+            if value < 0:
+                raise ValueError("spendLimitUsd must be >= 0")
+            meta.spendLimitUsd = value
     meta.updatedAt = _now_iso()
 
     paths = resolve_paths(project_id)

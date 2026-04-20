@@ -1,5 +1,7 @@
 # K-Dense BYOK
 
+[![Tests](https://github.com/K-Dense-AI/k-dense-byok/actions/workflows/tests.yml/badge.svg)](https://github.com/K-Dense-AI/k-dense-byok/actions/workflows/tests.yml)
+
 **Your own AI research assistant, running on your computer, powered by your API keys.**
 
 K-Dense BYOK (Bring Your Own Keys) is a free, open-source app that gives you an AI research assistant called **Kady**. Ask Kady a question or give it a task, and it figures out the best way to handle it - sometimes answering directly, sometimes spinning up specialized AI "experts" that work behind the scenes to get you a thorough result.

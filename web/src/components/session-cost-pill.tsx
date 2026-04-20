@@ -1,5 +1,6 @@
 "use client";
 
+import { AlertTriangleIcon, LockIcon } from "lucide-react";
 import { useMemo } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -9,6 +10,7 @@ import {
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
 import { cn } from "@/lib/utils";
+import type { ProjectCostSummary } from "@/lib/use-project-cost";
 import type {
   CostEntry,
   CostTurnBucket,
@@ -17,6 +19,8 @@ import type {
 
 interface SessionCostPillProps {
   summary: SessionCostSummary;
+  projectSummary?: ProjectCostSummary;
+  limitUsd?: number | null;
   loading?: boolean;
   className?: string;
 }
@@ -36,21 +40,37 @@ function formatTokens(n: number): string {
 }
 
 function shortModel(model: string): string {
-  // Trim `openrouter/` prefix for readability; keep the vendor/name body.
   return model.startsWith("openrouter/") ? model.slice("openrouter/".length) : model;
 }
 
 export function SessionCostPill({
   summary,
+  projectSummary,
+  limitUsd: limitUsdProp,
   loading = false,
   className,
 }: SessionCostPillProps) {
-  const hasData = summary.entries.length > 0 || summary.totalUsd > 0;
+  const projectTotal = projectSummary?.totalUsd ?? 0;
+  const sessionTotal = summary.totalUsd ?? 0;
+  const limitUsd =
+    limitUsdProp !== undefined
+      ? limitUsdProp
+      : projectSummary?.limitUsd ?? null;
+
+  const budgetState = projectSummary?.budget?.state ?? "ok";
+  const ratio =
+    limitUsd !== null && limitUsd > 0
+      ? Math.min(1, projectTotal / limitUsd)
+      : null;
+
+  const hasData =
+    summary.entries.length > 0 ||
+    sessionTotal > 0 ||
+    projectTotal > 0 ||
+    (projectSummary?.sessionCount ?? 0) > 0;
 
   const orderedTurns = useMemo<CostTurnBucket[]>(() => {
     const buckets = Object.values(summary.byTurn);
-    // Turn ids are ordered "<timestamp>-<slug>" by manifest.open_turn, so
-    // lexicographic sort is equivalent to chronological.
     buckets.sort((a, b) => (a.turnId < b.turnId ? -1 : a.turnId > b.turnId ? 1 : 0));
     return buckets;
   }, [summary]);
@@ -59,6 +79,9 @@ export function SessionCostPill({
     return null;
   }
 
+  const warnTone = budgetState === "warn";
+  const blockedTone = budgetState === "exceeded";
+
   return (
     <HoverCard closeDelay={120} openDelay={80}>
       <HoverCardTrigger asChild>
@@ -66,41 +89,138 @@ export function SessionCostPill({
           variant="outline"
           size="sm"
           className={cn(
-            "h-8 gap-1.5 font-mono text-xs tabular-nums",
+            "h-auto gap-2 px-2.5 py-1 font-mono text-[11px] tabular-nums",
             loading && "opacity-70",
+            warnTone &&
+              "border-amber-500/60 text-amber-600 dark:text-amber-400",
+            blockedTone &&
+              "border-destructive/60 text-destructive",
             className,
           )}
-          aria-label={`Session cost ${formatCost(summary.totalUsd)}`}
+          aria-label={
+            limitUsd !== null
+              ? `Project cost ${formatCost(projectTotal)} of ${formatCost(limitUsd)}, session cost ${formatCost(sessionTotal)}`
+              : `Project cost ${formatCost(projectTotal)}, session cost ${formatCost(sessionTotal)}`
+          }
         >
-          <span className="text-muted-foreground">cost</span>
-          <span className="font-semibold">{formatCost(summary.totalUsd)}</span>
+          <div className="flex items-center gap-2">
+            {blockedTone && <LockIcon className="size-3 shrink-0" aria-hidden />}
+            {warnTone && !blockedTone && (
+              <AlertTriangleIcon className="size-3 shrink-0" aria-hidden />
+            )}
+            <div className="flex flex-col items-end leading-tight">
+              <span className="flex items-baseline gap-1">
+                <span className="text-muted-foreground">proj</span>
+                <span className="font-semibold">{formatCost(projectTotal)}</span>
+                {limitUsd !== null && (
+                  <span className="text-muted-foreground">
+                    / {formatCost(limitUsd)}
+                  </span>
+                )}
+              </span>
+              <span className="flex items-baseline gap-1">
+                <span className="text-muted-foreground">sess</span>
+                <span className="font-semibold">{formatCost(sessionTotal)}</span>
+              </span>
+            </div>
+          </div>
+          {ratio !== null && (
+            <span
+              aria-hidden
+              className={cn(
+                "h-1 w-10 overflow-hidden rounded-full bg-muted",
+                "ml-0.5",
+              )}
+            >
+              <span
+                className={cn(
+                  "block h-full rounded-full transition-[width]",
+                  blockedTone
+                    ? "bg-destructive"
+                    : warnTone
+                      ? "bg-amber-500"
+                      : "bg-primary",
+                )}
+                style={{ width: `${Math.round(ratio * 100)}%` }}
+              />
+            </span>
+          )}
         </Button>
       </HoverCardTrigger>
       <HoverCardContent align="end" className="w-96 p-0">
+        {projectSummary && (
+          <div className="border-b p-4">
+            <div className="text-muted-foreground text-xs uppercase tracking-wide">
+              Project total
+            </div>
+            <div className="mt-1 flex items-baseline gap-2">
+              <div className="font-mono text-2xl font-semibold tabular-nums">
+                {formatCost(projectTotal)}
+              </div>
+              {limitUsd !== null && (
+                <div className="text-muted-foreground font-mono text-sm tabular-nums">
+                  / {formatCost(limitUsd)}
+                </div>
+              )}
+            </div>
+            <div className="text-muted-foreground mt-0.5 text-xs">
+              {formatTokens(projectSummary.totalTokens)} tokens across{" "}
+              {projectSummary.sessionCount} session
+              {projectSummary.sessionCount === 1 ? "" : "s"}
+            </div>
+            {ratio !== null && (
+              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div
+                  className={cn(
+                    "h-full rounded-full",
+                    blockedTone
+                      ? "bg-destructive"
+                      : warnTone
+                        ? "bg-amber-500"
+                        : "bg-primary",
+                  )}
+                  style={{ width: `${Math.round(ratio * 100)}%` }}
+                />
+              </div>
+            )}
+            {blockedTone && (
+              <div className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                Spend limit reached. Delegations are blocked until the limit
+                is raised.
+              </div>
+            )}
+            {warnTone && (
+              <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+                Approaching the spend limit (≥80%).
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="border-b p-4">
           <div className="text-muted-foreground text-xs uppercase tracking-wide">
-            Session cost
+            This session
           </div>
-          <div className="mt-1 font-mono text-2xl font-semibold tabular-nums">
-            {formatCost(summary.totalUsd)}
+          <div className="mt-1 font-mono text-xl font-semibold tabular-nums">
+            {formatCost(sessionTotal)}
           </div>
           <div className="text-muted-foreground mt-0.5 text-xs">
             {formatTokens(summary.totalTokens)} tokens across{" "}
-            {summary.entries.length} call{summary.entries.length === 1 ? "" : "s"}
+            {summary.entries.length} call
+            {summary.entries.length === 1 ? "" : "s"}
           </div>
-        </div>
-
-        <div className="border-b p-4">
-          <CostRow
-            label="Orchestrator"
-            costUsd={summary.orchestratorUsd}
-            tokens={summary.orchestratorTokens}
-          />
-          <CostRow
-            label="Expert"
-            costUsd={summary.expertUsd}
-            tokens={summary.expertTokens}
-          />
+          <div className="mt-2">
+            <CostRow
+              label="Orchestrator"
+              costUsd={summary.orchestratorUsd}
+              tokens={summary.orchestratorTokens}
+            />
+            <CostRow
+              label="Expert"
+              costUsd={summary.expertUsd}
+              tokens={summary.expertTokens}
+            />
+          </div>
         </div>
 
         <div className="max-h-60 overflow-y-auto p-2">

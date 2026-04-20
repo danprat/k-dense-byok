@@ -40,6 +40,7 @@ import { CitationBadge } from "@/components/citation-badge";
 import { ProjectSwitcher } from "@/components/project-switcher";
 import { SessionCostPill } from "@/components/session-cost-pill";
 import { useSessionCost } from "@/lib/use-session-cost";
+import { useProjectCost } from "@/lib/use-project-cost";
 import type { ChatMessage } from "@/lib/use-agent";
 import { APP_VERSION, useUpdateCheck } from "@/lib/version";
 import { useAgent, type ActivityItem } from "@/lib/use-agent";
@@ -94,6 +95,60 @@ interface QueuedMessage {
   skills: Skill[];
   files: string[];
   timestamp: number;
+}
+
+function formatBudgetCost(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Inline banner above the chat input when the project is approaching (warn)
+ * or over (exceeded) its spend limit. Rendered by ChatInput (and mirrored
+ * above the Workflows launch button) when ``budgetState !== "ok"``.
+ */
+function BudgetBanner({
+  state,
+  totalUsd,
+  limitUsd,
+}: {
+  state: "warn" | "exceeded";
+  totalUsd: number;
+  limitUsd: number | null;
+}) {
+  const blocked = state === "exceeded";
+  return (
+    <div
+      role="alert"
+      className={cn(
+        "mb-2 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs",
+        blocked
+          ? "border-destructive/40 bg-destructive/10 text-destructive"
+          : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      )}
+    >
+      <span className="flex-1">
+        {blocked ? (
+          <>
+            <b>Project spend limit reached</b> (
+            {formatBudgetCost(totalUsd)}
+            {limitUsd !== null ? ` / ${formatBudgetCost(limitUsd)}` : ""})
+            . New delegations are blocked. Raise the limit in the project
+            settings to continue.
+          </>
+        ) : (
+          <>
+            <b>Approaching spend limit</b> (
+            {formatBudgetCost(totalUsd)}
+            {limitUsd !== null ? ` / ${formatBudgetCost(limitUsd)}` : ""})
+            . You're over 80% of the project's cap.
+          </>
+        )}
+      </span>
+    </div>
+  );
 }
 
 // Thin vertical drag handle between two panels
@@ -490,6 +545,9 @@ function ChatInput({
   onSkillsChange,
   queuedMessages,
   onRemoveFromQueue,
+  budgetState = "ok",
+  budgetTotalUsd = 0,
+  budgetLimitUsd = null,
 }: {
   allFiles: string[];
   attachedFiles: string[];
@@ -515,7 +573,11 @@ function ChatInput({
   onSkillsChange: (skills: Skill[]) => void;
   queuedMessages: QueuedMessage[];
   onRemoveFromQueue: (id: string) => void;
+  budgetState?: "ok" | "warn" | "exceeded";
+  budgetTotalUsd?: number;
+  budgetLimitUsd?: number | null;
 }) {
+  const budgetBlocked = budgetState === "exceeded";
   const controller = usePromptInputController();
   const browserUse = useBrowserUseSettings();
   const chromeProfiles = useChromeProfiles();
@@ -528,6 +590,12 @@ function ChatInput({
   // Wrap onSubmit to append attached file paths and database context, then clear chips
   const handleSubmit = useCallback<Parameters<typeof PromptInput>[0]["onSubmit"]>(
     (msg, event) => {
+      if (budgetBlocked) {
+        // Belt-and-braces guard: the submit button is already disabled in this
+        // state, but Enter-key submission could otherwise slip past it.
+        event?.preventDefault();
+        return;
+      }
       const refs = attachedFiles.length > 0 ? "\n" + attachedFiles.join("\n") : "";
       const dbCtx = buildDatabaseContext(selectedDbs);
       const computeCtx = buildComputeContext(selectedCompute);
@@ -536,7 +604,7 @@ function ChatInput({
       onSubmit({ ...msg, text: msg.text + refs + dbCtx + computeCtx + skillsCtx + browserCtx }, event);
       onClearFiles();
     },
-    [onSubmit, attachedFiles, onClearFiles, selectedDbs, selectedCompute, selectedSkills, browserUse.config, chromeProfiles.profiles]
+    [budgetBlocked, onSubmit, attachedFiles, onClearFiles, selectedDbs, selectedCompute, selectedSkills, browserUse.config, chromeProfiles.profiles]
   );
 
   // @ mention state
@@ -690,6 +758,14 @@ function ChatInput({
           <MessageQueueDisplay queue={queuedMessages} onRemove={onRemoveFromQueue} />
         )}
 
+        {budgetState !== "ok" && (
+          <BudgetBanner
+            state={budgetState}
+            totalUsd={budgetTotalUsd}
+            limitUsd={budgetLimitUsd}
+          />
+        )}
+
         <PromptInput onSubmit={handleSubmit} className="rounded-xl border shadow-sm">
           <ContextChipsBar
             attachedFiles={attachedFiles}
@@ -753,7 +829,18 @@ function ChatInput({
               </InfoTooltip>
               <InfoTooltip
                 content={
-                  isStreaming ? (
+                  budgetBlocked ? (
+                    <>
+                      <b>Spend limit reached</b>
+                      <br />
+                      Project has hit its spend limit (
+                      {formatBudgetCost(budgetTotalUsd)}
+                      {budgetLimitUsd !== null
+                        ? ` / ${formatBudgetCost(budgetLimitUsd)}`
+                        : ""}
+                      ). Raise the limit in the project settings to continue.
+                    </>
+                  ) : isStreaming ? (
                     <>
                       <b>Stop</b>
                       <br />
@@ -780,6 +867,7 @@ function ChatInput({
                 <PromptInputSubmit
                   status={submitStatus as "streaming" | "error" | "ready"}
                   onStop={onStop}
+                  disabled={budgetBlocked && !isStreaming}
                 />
               </InfoTooltip>
             </div>
@@ -823,6 +911,8 @@ export default function ChatPage() {
     getSessionId(),
     costRefreshKey,
   );
+  const { summary: projectCost, loading: projectCostLoading } =
+    useProjectCost(costRefreshKey);
 
   useEffect(() => setMounted(true), []);
 
@@ -934,6 +1024,12 @@ export default function ChatPage() {
 
   const handleWorkflowLaunch = useCallback(
     async (prompt: string, model: Model, compute: ModalInstance | null, suggestedSkills: string[], uploadedFiles: string[]) => {
+      if (projectCost.budget.state === "exceeded") {
+        // Silent no-op: the WorkflowsPanel's Launch button is already
+        // disabled in this state, but guarding here too keeps any future
+        // programmatic caller honest.
+        return;
+      }
       setSelectedModel(model);
       // Workflows only expose a single model picker today; mirror the
       // chosen model to the expert slot so the whole pipeline runs on it.
@@ -965,11 +1061,16 @@ export default function ChatPage() {
         });
       }
     },
-    [send]
+    [send, projectCost.budget.state]
   );
 
   const handleSubmit = useCallback(
     async ({ text }: { text: string }) => {
+      if (projectCost.budget.state === "exceeded") {
+        // Budget gate: ChatInput already blocks the submit button + Enter,
+        // this is the belt-and-braces guard covering any caller path.
+        return;
+      }
       if (isStreaming) {
         if (messageQueue.length >= MAX_QUEUE) return;
         const rawText = text.split("\n")[0];
@@ -1009,7 +1110,7 @@ export default function ChatPage() {
         });
       }
     },
-    [send, selectedModel, selectedExpertModel, selectedDbs, selectedCompute, selectedSkills, attachedFiles, isStreaming, messageQueue.length]
+    [send, selectedModel, selectedExpertModel, selectedDbs, selectedCompute, selectedSkills, attachedFiles, isStreaming, messageQueue.length, projectCost.budget.state]
   );
 
   // Auto-send the next queued message when the agent becomes ready
@@ -1095,7 +1196,12 @@ export default function ChatPage() {
           Brought to you by K-Dense, Inc.
         </p>
         <div className="flex items-center gap-2">
-          <SessionCostPill summary={costSummary} loading={costLoading} />
+          <SessionCostPill
+            summary={costSummary}
+            projectSummary={projectCost}
+            limitUsd={projectCost.limitUsd}
+            loading={costLoading || projectCostLoading}
+          />
           {messages.length > 0 && (
             <>
               <InfoTooltip
@@ -1410,6 +1516,9 @@ export default function ChatPage() {
                     onSkillsChange={setSelectedSkills}
                     queuedMessages={messageQueue}
                     onRemoveFromQueue={removeFromQueue}
+                    budgetState={projectCost.budget.state}
+                    budgetTotalUsd={projectCost.budget.totalUsd}
+                    budgetLimitUsd={projectCost.budget.limitUsd}
                   />
                 </PromptInputProvider>
               </div>
@@ -1419,6 +1528,7 @@ export default function ChatPage() {
               onLaunch={handleWorkflowLaunch}
               onUploadFiles={sandbox.uploadFiles}
               modalConfigured={config.modalConfigured}
+              budgetBlocked={projectCost.budget.state === "exceeded"}
             />
           )}
         </div>
