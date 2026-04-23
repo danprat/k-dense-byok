@@ -64,6 +64,47 @@ async def test_ollama_unavailable_returns_empty_list(asgi_client, monkeypatch):
     assert resp.json() == {"available": False, "models": []}
 
 
+async def test_custom_models_unconfigured_returns_empty_list(asgi_client, monkeypatch):
+    monkeypatch.delenv("CUSTOM_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("CUSTOM_OPENAI_MODELS", raising=False)
+    resp = await asgi_client.get("/custom/models")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "configured": False, "models": []}
+
+
+async def test_custom_models_missing_api_key_returns_empty_list(asgi_client, monkeypatch):
+    monkeypatch.setenv("CUSTOM_OPENAI_BASE_URL", "https://litellm.example.com")
+    monkeypatch.setenv("CUSTOM_OPENAI_MODELS", "gpt-5.4-proxy")
+    monkeypatch.delenv("CUSTOM_OPENAI_API_KEY", raising=False)
+
+    resp = await asgi_client.get("/custom/models")
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "configured": False, "models": []}
+
+
+async def test_custom_models_configured_returns_normalized_entries(asgi_client, monkeypatch):
+    monkeypatch.setenv("CUSTOM_OPENAI_BASE_URL", "https://litellm.example.com")
+    monkeypatch.setenv(
+        "CUSTOM_OPENAI_MODELS",
+        "gemini-3-flash-proxy, gpt-5.4-proxy , minimax-m2.5-proxy",
+    )
+    monkeypatch.setenv("CUSTOM_OPENAI_API_KEY", "secret-value")
+
+    resp = await asgi_client.get("/custom/models")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["configured"] is True
+    assert [m["id"] for m in body["models"]] == [
+        "custom/gemini-3-flash-proxy",
+        "custom/gpt-5.4-proxy",
+        "custom/minimax-m2.5-proxy",
+    ]
+    assert all(m["provider"] == "Custom" for m in body["models"])
+    assert all("secret-value" not in json.dumps(m) for m in body["models"])
+    assert all("litellm.example.com" not in json.dumps(m) for m in body["models"])
+
+
 # ---------------------------------------------------------------------------
 # Custom MCPs settings round-trip
 # ---------------------------------------------------------------------------
@@ -267,6 +308,29 @@ async def test_revise_markdown_calls_litellm(asgi_client, no_litellm, monkeypatc
     body = resp.json()
     assert body["revised"] == "stub revised text"
     assert body["model"] == "openrouter/x/y"
+
+
+async def test_revise_markdown_custom_model_passes_openai_endpoint_wiring(
+    asgi_client, no_litellm, monkeypatch
+):
+    monkeypatch.setenv("CUSTOM_OPENAI_BASE_URL", "https://litellm.example.com/v1")
+    monkeypatch.setenv("CUSTOM_OPENAI_API_KEY", "secret-value")
+
+    resp = await asgi_client.post(
+        "/revise-markdown",
+        json={
+            "selection": "hello",
+            "instruction": "make it shout",
+            "model": "custom/gpt-5.4-proxy",
+        },
+    )
+    assert resp.status_code == 200
+
+    call = no_litellm["calls"][-1]
+    assert call["model"] == "gpt-5.4-proxy"
+    assert call["api_base"] == "https://litellm.example.com/v1"
+    assert call["api_key"] == "secret-value"
+    assert call["custom_llm_provider"] == "openai"
 
 
 async def test_revise_markdown_requires_selection(asgi_client):

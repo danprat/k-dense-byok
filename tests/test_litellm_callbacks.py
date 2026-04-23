@@ -36,6 +36,11 @@ def test_strip_openrouter_prefix_passthrough_non_openrouter():
     assert cb._strip_openrouter_prefix(None) is None
 
 
+def test_strip_custom_prefix_drops_provider_prefix():
+    assert cb._strip_custom_prefix("custom/gpt-5.4-proxy") == "gpt-5.4-proxy"
+    assert cb._strip_custom_prefix("gpt-5.4-proxy") == "gpt-5.4-proxy"
+
+
 # ---------------------------------------------------------------------------
 # _merge_header_sources
 # ---------------------------------------------------------------------------
@@ -177,3 +182,17 @@ def test_patched_get_llm_provider_passthrough_for_other_provider(monkeypatch):
     monkeypatch.setattr(cb, "_ORIG_GET_LLM_PROVIDER", fake_orig)
     cb._patched_get_llm_provider(model="gemini-pro", custom_llm_provider="vertex_ai")
     assert captured["provider"] == "vertex_ai"
+
+
+def test_patched_get_llm_provider_strips_custom_prefix(monkeypatch):
+    captured = {}
+
+    def fake_orig(model, custom_llm_provider=None, **kw):
+        captured["model"] = model
+        captured["provider"] = custom_llm_provider
+        return ("x", None, None, None)
+
+    monkeypatch.setattr(cb, "_ORIG_GET_LLM_PROVIDER", fake_orig)
+    cb._patched_get_llm_provider(model="custom/gpt-5.4-proxy", custom_llm_provider="openai")
+    assert captured["model"] == "gpt-5.4-proxy"
+    assert captured["provider"] == "openai"

@@ -33,10 +33,6 @@ const STATIC_MODELS = models as Model[];
 
 const DEFAULT_MODEL = STATIC_MODELS.find((m) => m.default) ?? STATIC_MODELS[0];
 
-// The Gemini CLI expert is a tool-heavy subprocess. Gemini 3.1 Pro's native
-// tool support and million-token context make it the recommended default,
-// distinct from the orchestrator's Claude Opus default. Falls back to the
-// generic default so callers without an explicit expert pick still work.
 const DEFAULT_EXPERT_MODEL =
   STATIC_MODELS.find((m) => m.expertDefault) ?? DEFAULT_MODEL;
 
@@ -55,6 +51,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   xAI:       "text-rose-600 dark:text-rose-400",
   Meta:      "text-indigo-600 dark:text-indigo-400",
   Ollama:    "text-teal-600 dark:text-teal-400",
+  Custom:    "text-fuchsia-600 dark:text-fuchsia-400",
 };
 
 const isOllama = (m: Model) => m.provider === "Ollama" || m.id.startsWith("ollama/");
@@ -94,7 +91,14 @@ interface ModelPickerListProps {
 
 function ModelPickerList({ selected, onSelect, compact, role = "orchestrator" }: ModelPickerListProps) {
   const [search, setSearch] = useState("");
-  const { models: allModels, ollamaAvailable, ollamaModels, refresh } = useModels();
+  const {
+    models: allModels,
+    ollamaAvailable,
+    ollamaModels,
+    defaultModel,
+    defaultExpertModel,
+    refresh,
+  } = useModels();
 
   // PopoverContent unmounts when closed, so this effectively re-probes
   // Ollama each time the user opens the picker — lets them start the
@@ -122,8 +126,8 @@ function ModelPickerList({ selected, onSelect, compact, role = "orchestrator" }:
 
   const isRecommended = (m: Model): boolean =>
     role === "expert"
-      ? Boolean(m.expertDefault) || (!STATIC_MODELS.some((x) => x.expertDefault) && Boolean(m.default))
-      : Boolean(m.default);
+      ? defaultExpertModel?.id === m.id
+      : defaultModel?.id === m.id;
 
   const renderModelRow = (model: Model) => {
     const isSelected = selected.id === model.id;

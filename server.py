@@ -212,6 +212,45 @@ def _ollama_entry(tag: dict) -> dict:
     }
 
 
+def _parse_custom_models(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _custom_model_entry(model_name: str, _base_url: str) -> dict:
+    return {
+        "id": f"custom/{model_name}",
+        "label": model_name,
+        "provider": "Custom",
+        "tier": "high",
+        "context_length": 0,
+        "pricing": {"prompt": 0.0, "completion": 0.0},
+        "modality": "text->text",
+        "description": "Model routed through a custom OpenAI-compatible endpoint.",
+    }
+
+
+def _strip_custom_model_prefix(model: str) -> str:
+    if isinstance(model, str) and model.startswith("custom/"):
+        return model[len("custom/") :]
+    return model
+
+
+def _custom_model_litellm_kwargs(model: str) -> dict:
+    if not (isinstance(model, str) and model.startswith("custom/")):
+        return {}
+
+    api_base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
+    if not api_base or not api_key:
+        return {}
+
+    return {
+        "api_base": api_base,
+        "api_key": api_key,
+        "custom_llm_provider": "openai",
+    }
+
+
 @app.get("/ollama/models")
 async def list_ollama_models():
     """Proxy to ``GET {OLLAMA_BASE_URL}/api/tags`` and map into the UI's
@@ -237,6 +276,24 @@ async def list_ollama_models():
     tags = data.get("models") or []
     entries = [_ollama_entry(t) for t in tags if isinstance(t, dict)]
     return {"available": True, "models": entries}
+
+
+@app.get("/custom/models")
+async def list_custom_models():
+    """Return env-configured custom OpenAI-compatible models in the UI shape."""
+    base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
+    raw_models = os.environ.get("CUSTOM_OPENAI_MODELS", "").strip()
+    if not base or not api_key or not raw_models:
+        return {"available": False, "configured": False, "models": []}
+    models = _parse_custom_models(raw_models)
+    if not models:
+        return {"available": False, "configured": False, "models": []}
+    return {
+        "available": True,
+        "configured": True,
+        "models": [_custom_model_entry(model, base) for model in models],
+    }
 
 
 @app.get("/settings/mcps")
@@ -1053,6 +1110,7 @@ async def revise_markdown(request: Request):
         if isinstance(model_override, str) and model_override.strip()
         else DEFAULT_MODEL
     )
+    request_model = _strip_custom_model_prefix(model)
     if not model:
         raise HTTPException(
             status_code=500,
@@ -1071,17 +1129,20 @@ async def revise_markdown(request: Request):
     user_message_parts.append("SELECTION (rewrite this):\n" + selection)
     user_message = "\n\n".join(user_message_parts)
 
+    litellm_kwargs = {
+        "model": request_model,
+        "messages": [
+            {"role": "system", "content": _REVISE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "extra_headers": EXTRA_HEADERS,
+        "temperature": 0.2,
+        "timeout": 120,
+        **_custom_model_litellm_kwargs(model),
+    }
+
     try:
-        response = await litellm.acompletion(
-            model=model,
-            messages=[
-                {"role": "system", "content": _REVISE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            extra_headers=EXTRA_HEADERS,
-            temperature=0.2,
-            timeout=120,
-        )
+        response = await litellm.acompletion(**litellm_kwargs)
     except Exception as exc:  # noqa: BLE001 — surface upstream errors verbatim
         raise HTTPException(status_code=502, detail=f"Model call failed: {exc}")
 

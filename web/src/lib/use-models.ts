@@ -1,44 +1,51 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import staticModels from "@/data/models.json";
 import type { Model } from "@/components/model-selector";
 import { apiFetch, onProjectChange } from "@/lib/projects";
 
-const OPENROUTER_MODELS = staticModels as Model[];
-
-interface OllamaListResponse {
+interface DynamicModelListResponse {
   available?: boolean;
+  configured?: boolean;
   models?: Model[];
 }
 
 export interface UseModelsReturn {
-  /** Every model available to the user: static OpenRouter catalogue + live Ollama tags. */
+  /** Every model currently available from the supported live providers. */
   models: Model[];
   /** Just the Ollama-sourced entries, in the order returned by the backend. */
   ollamaModels: Model[];
+  /** Just the custom-endpoint entries, in the order returned by the backend. */
+  customModels: Model[];
   /** True when the backend was able to reach `OLLAMA_BASE_URL/api/tags`. */
   ollamaAvailable: boolean;
-  /** Re-fetch the Ollama list. */
+  /** True when the custom provider is configured and available. */
+  customAvailable: boolean;
+  /** Explicit orchestrator default, preferring the custom GPT proxy when available. */
+  defaultModel?: Model;
+  /** Explicit expert default, preferring the custom Gemini proxy when available. */
+  defaultExpertModel?: Model;
+  /** Re-fetch the dynamic provider lists. */
   refresh: () => void;
 }
 
 /**
- * Merge the static OpenRouter-derived `models.json` with whatever models
- * are currently pulled in the user's local Ollama server.
+ * Return the models currently exposed by our supported runtime providers.
  *
- * Ollama discovery is best-effort: if the daemon is offline we silently
- * fall back to OpenRouter-only. The hook re-fetches on project change to
- * keep the list fresh when the user returns after pulling a new model.
+ * We intentionally prefer live provider discovery over the old static
+ * OpenRouter catalogue so both the orchestrator and Gemini CLI expert stay
+ * on the project's configured custom endpoint (or local Ollama) end-to-end.
  */
 export function useModels(): UseModelsReturn {
   const [ollamaModels, setOllamaModels] = useState<Model[]>([]);
+  const [customModels, setCustomModels] = useState<Model[]>([]);
   const [ollamaAvailable, setOllamaAvailable] = useState(false);
+  const [customAvailable, setCustomAvailable] = useState(false);
 
-  const fetchOllama = useCallback(() => {
+  const fetchDynamicModels = useCallback(() => {
     apiFetch("/ollama/models")
-      .then((r) => (r.ok ? (r.json() as Promise<OllamaListResponse>) : null))
+      .then((r) => (r.ok ? (r.json() as Promise<DynamicModelListResponse>) : null))
       .then((data) => {
         if (!data) return;
         setOllamaAvailable(Boolean(data.available));
@@ -48,18 +55,46 @@ export function useModels(): UseModelsReturn {
         setOllamaAvailable(false);
         setOllamaModels([]);
       });
+
+    apiFetch("/custom/models")
+      .then((r) => (r.ok ? (r.json() as Promise<DynamicModelListResponse>) : null))
+      .then((data) => {
+        if (!data) return;
+        setCustomAvailable(Boolean(data.available));
+        setCustomModels(Array.isArray(data.models) ? data.models : []);
+      })
+      .catch(() => {
+        setCustomAvailable(false);
+        setCustomModels([]);
+      });
   }, []);
 
   useEffect(() => {
-    fetchOllama();
-  }, [fetchOllama]);
+    fetchDynamicModels();
+  }, [fetchDynamicModels]);
 
-  useEffect(() => onProjectChange(() => fetchOllama()), [fetchOllama]);
+  useEffect(() => onProjectChange(() => fetchDynamicModels()), [fetchDynamicModels]);
+
+  const models = useMemo(() => [...customModels, ...ollamaModels], [customModels, ollamaModels]);
+
+  const defaultModel = useMemo(
+    () => customModels.find((m) => m.id === "custom/gpt-5.4-proxy") ?? customModels[0] ?? ollamaModels[0],
+    [customModels, ollamaModels],
+  );
+
+  const defaultExpertModel = useMemo(
+    () => customModels.find((m) => m.id === "custom/gemini-3-pro-proxy"),
+    [customModels],
+  );
 
   return {
-    models: [...OPENROUTER_MODELS, ...ollamaModels],
+    models,
     ollamaModels,
+    customModels,
     ollamaAvailable,
-    refresh: fetchOllama,
+    customAvailable,
+    defaultModel,
+    defaultExpertModel,
+    refresh: fetchDynamicModels,
   };
 }

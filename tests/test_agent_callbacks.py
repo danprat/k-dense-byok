@@ -186,6 +186,80 @@ def test_record_skips_non_openrouter_provider(active_project):
     )
 
 
+def test_override_model_custom_model_sets_openai_endpoint(monkeypatch):
+    monkeypatch.setenv("CUSTOM_OPENAI_BASE_URL", "https://litellm.example.com/v1/")
+    monkeypatch.setenv("CUSTOM_OPENAI_API_KEY", "secret-value")
+
+    original_args = dict(agent_module._LITELLM_MODEL._additional_args)
+    agent_module._LITELLM_MODEL._additional_args = {}
+    try:
+        callback_context = types.SimpleNamespace(state={"_model": "custom/gpt-5.4-proxy"})
+        llm_request = types.SimpleNamespace(model="openrouter/anthropic/claude-opus-4.7")
+
+        agent_module._override_model(callback_context, llm_request)
+
+        assert llm_request.model == "gpt-5.4-proxy"
+        assert agent_module._LITELLM_MODEL._additional_args["api_base"] == (
+            "https://litellm.example.com/v1"
+        )
+        assert agent_module._LITELLM_MODEL._additional_args["api_key"] == "secret-value"
+        assert agent_module._LITELLM_MODEL._additional_args["custom_llm_provider"] == "openai"
+    finally:
+        agent_module._LITELLM_MODEL._additional_args = original_args
+
+
+def test_override_model_non_custom_model_clears_custom_endpoint(monkeypatch):
+    monkeypatch.delenv("CUSTOM_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("CUSTOM_OPENAI_API_KEY", raising=False)
+
+    original_args = dict(agent_module._LITELLM_MODEL._additional_args)
+    agent_module._LITELLM_MODEL._additional_args = {
+        "api_base": "https://litellm.example.com/v1",
+        "api_key": "secret-value",
+        "custom_llm_provider": "openai",
+    }
+    try:
+        callback_context = types.SimpleNamespace(state={"_model": "openrouter/anthropic/claude-opus-4.7"})
+        llm_request = types.SimpleNamespace(model="openrouter/anthropic/claude-opus-4.7")
+
+        agent_module._override_model(callback_context, llm_request)
+
+        assert "api_base" not in agent_module._LITELLM_MODEL._additional_args
+        assert "api_key" not in agent_module._LITELLM_MODEL._additional_args
+        assert "custom_llm_provider" not in agent_module._LITELLM_MODEL._additional_args
+    finally:
+        agent_module._LITELLM_MODEL._additional_args = original_args
+
+
+async def test_open_turn_manifest_uses_default_expert_model_when_missing(monkeypatch):
+    state = {"_model": "custom/gpt-5.4-proxy"}
+    session = types.SimpleNamespace(id="s1")
+    invocation_context = types.SimpleNamespace(
+        session=session,
+        user_content=types.SimpleNamespace(parts=[types.SimpleNamespace(text="hello")]),
+    )
+    callback_context = types.SimpleNamespace(
+        state=state,
+        _invocation_context=invocation_context,
+    )
+
+    captured = {}
+
+    async def fake_open_turn(**kwargs):
+        captured.update(kwargs)
+        return ("turn-1", {})
+
+    monkeypatch.setattr(agent_module, "open_turn", fake_open_turn)
+    monkeypatch.setattr(agent_module, "DEFAULT_EXPERT_MODEL", "custom/gemini-3-pro-proxy")
+
+    await agent_module._open_turn_manifest(callback_context)
+
+    assert captured["model"] == "custom/gpt-5.4-proxy"
+    assert captured["expert_model"] == "custom/gemini-3-pro-proxy"
+    assert state["_turnId"] == "turn-1"
+    assert state["_sessionId"] == "s1"
+
+
 # ---------------------------------------------------------------------------
 # _fetch_openrouter_generation_cost
 # ---------------------------------------------------------------------------

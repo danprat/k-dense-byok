@@ -46,6 +46,7 @@ import { APP_VERSION, useUpdateCheck } from "@/lib/version";
 import { useAgent, type ActivityItem } from "@/lib/use-agent";
 import { useConfig } from "@/lib/use-config";
 import { useSkills } from "@/lib/use-skills";
+import { useModels } from "@/lib/use-models";
 import type { TurnMeta } from "@/lib/provenance";
 import { hasDirectoryEntries, traverseDroppedEntries } from "@/lib/directory-upload";
 import { useSandbox, fileCategory, type TreeNode } from "@/lib/use-sandbox";
@@ -896,6 +897,7 @@ export default function ChatPage() {
   const isStreaming = status === "streaming" || status === "submitted";
   const sandbox = useSandbox(isStreaming);
   const config = useConfig();
+  const { defaultModel, defaultExpertModel } = useModels();
   const { updateAvailable } = useUpdateCheck();
   const { skills: allSkills } = useSkills();
   const { resolvedTheme, setTheme } = useTheme();
@@ -979,6 +981,18 @@ export default function ChatPage() {
   const [selectedModel, setSelectedModel] = useState<Model>(DEFAULT_MODEL);
   const [selectedExpertModel, setSelectedExpertModel] = useState<Model>(DEFAULT_EXPERT_MODEL);
 
+  useEffect(() => {
+    if (defaultModel && selectedModel.id === DEFAULT_MODEL.id) {
+      setSelectedModel(defaultModel);
+    }
+  }, [defaultModel, selectedModel.id]);
+
+  useEffect(() => {
+    if (defaultExpertModel && selectedExpertModel.id === DEFAULT_EXPERT_MODEL.id) {
+      setSelectedExpertModel(defaultExpertModel);
+    }
+  }, [defaultExpertModel, selectedExpertModel.id]);
+
   const handleCopy = useCallback((id: string, content: string) => {
     navigator.clipboard.writeText(content);
     setCopiedId(id);
@@ -1031,9 +1045,6 @@ export default function ChatPage() {
         return;
       }
       setSelectedModel(model);
-      // Workflows only expose a single model picker today; mirror the
-      // chosen model to the expert slot so the whole pipeline runs on it.
-      setSelectedExpertModel(model);
       setSelectedCompute(compute);
       setActiveTab("chat");
       const fileRefs = uploadedFiles.length > 0 ? "\n" + uploadedFiles.join("\n") : "";
@@ -1043,7 +1054,7 @@ export default function ChatPage() {
         : "";
       const fullPrompt = prompt + fileRefs + computeCtx + skillsCtx;
       const msgId = await send(fullPrompt, model.id, {
-        expertModel: model.id,
+        expertModel: selectedExpertModel.id,
         attachments: uploadedFiles,
         skills: suggestedSkills,
         databases: [],
@@ -1052,7 +1063,7 @@ export default function ChatPage() {
       if (msgId) {
         turnMetaRef.current.set(msgId, {
           model: model.label,
-          expertModel: model.label,
+          expertModel: selectedExpertModel.label,
           databases: [],
           compute: compute?.label ?? null,
           skills: suggestedSkills,
@@ -1061,7 +1072,7 @@ export default function ChatPage() {
         });
       }
     },
-    [send, projectCost.budget.state]
+    [send, projectCost.budget.state, selectedExpertModel]
   );
 
   const handleSubmit = useCallback(

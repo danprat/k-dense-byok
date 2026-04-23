@@ -44,6 +44,13 @@ _ORIG_GET_LLM_PROVIDER = get_llm_provider_logic.get_llm_provider
 _ORIG_OR_TRANSFORM_REQUEST = OpenrouterConfig.transform_request
 
 
+def _strip_provider_prefix(model: str, prefix: str) -> str:
+    """Drop a provider prefix on routed wildcard ids before the upstream call."""
+    if isinstance(model, str) and model.startswith(prefix):
+        return model[len(prefix) :]
+    return model
+
+
 def _strip_openrouter_prefix(model: str) -> str:
     """Drop a stray ``openrouter/`` prefix on ``<vendor>/<name>`` ids."""
     if (
@@ -51,7 +58,14 @@ def _strip_openrouter_prefix(model: str) -> str:
         and model.startswith("openrouter/")
         and model.count("/") >= 2
     ):
-        return model[len("openrouter/") :]
+        return _strip_provider_prefix(model, "openrouter/")
+    return model
+
+
+def _strip_custom_prefix(model: str) -> str:
+    """Drop the ``custom/`` prefix before dispatching to OpenAI-compatible APIs."""
+    if isinstance(model, str) and model.startswith("custom/"):
+        return _strip_provider_prefix(model, "custom/")
     return model
 
 
@@ -64,6 +78,7 @@ def _patched_transform_request(  # type: ignore[no-untyped-def]
     headers,
 ):
     model = _strip_openrouter_prefix(model)
+    model = _strip_custom_prefix(model)
     return _ORIG_OR_TRANSFORM_REQUEST(
         self, model, messages, optional_params, litellm_params, headers
     )
@@ -99,6 +114,12 @@ def _patched_get_llm_provider(  # type: ignore[no-untyped-def]
         # explicitly hits a bugged branch that keeps (or re-adds) the
         # prefix before the HTTP call.
         custom_llm_provider = None
+    if (
+        isinstance(model, str)
+        and model.startswith("custom/")
+        and custom_llm_provider == "openai"
+    ):
+        model = _strip_custom_prefix(model)
     return _ORIG_GET_LLM_PROVIDER(
         model=model,
         custom_llm_provider=custom_llm_provider,

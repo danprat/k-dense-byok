@@ -5,10 +5,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import litellm
 from dotenv import load_dotenv
 from google.adk.tools.tool_context import ToolContext
 
-from ..cost_ledger import check_project_budget
+from ..cost_ledger import check_project_budget, record_cost
 from ..manifest import (
     attach_delegation,
     session_seed,
@@ -19,77 +20,79 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(REPO_ROOT / "kady_agent" / ".env")
 
-_VERTEX_AI_ENV_VARS = ("GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_APPLICATION_CREDENTIALS")
-
-# OpenRouter "App" label (via LiteLLM proxy). Format: gemini-cli-core GEMINI_CLI_CUSTOM_HEADERS.
-_CLI_OPENROUTER_HEADERS = (
-    "X-Title: Kady-Expert, HTTP-Referer: https://www.k-dense.ai"
-)
-
-
-def _cli_can_route(model: str) -> bool:
-    """Return True when the Gemini CLI + our LiteLLM proxy can handle *model*.
-
-    The expert subprocess routes through the LiteLLM proxy at
-    ``GOOGLE_GEMINI_BASE_URL``. Only models configured there resolve:
-    the explicit ``gemini-*`` entries, the ``ollama/*`` wildcard, and
-    the ``openrouter/*`` wildcard. Anything else would cause the CLI to
-    hang on a 404 from the proxy, so we drop the ``-m`` flag and let the
-    CLI fall back to its built-in default Gemini model.
-    """
-    return (
-        model.startswith("gemini-")
-        or model.startswith("ollama/")
-        or model.startswith("openrouter/")
-    )
+_DEFAULT_EXPERT_MODEL = os.getenv("DEFAULT_EXPERT_MODEL", "custom/gpt-5.4-proxy").strip()
+_EXPERT_HEADERS = {
+    "X-Title": "Kady-Expert",
+    "HTTP-Referer": "https://www.k-dense.ai",
+}
 
 
-def _parse_stream_json(raw: str) -> dict:
-    """Parse Gemini CLI stream-json (JSONL) output into a structured result.
+def _strip_custom_model_prefix(model: str) -> str:
+    if isinstance(model, str) and model.startswith("custom/"):
+        return model[len("custom/") :]
+    return model
 
-    Extracts the final response text, activated skills, and tools used from
-    the JSONL event stream so callers get richer metadata than the plain JSON
-    format provides.
-    """
-    response_parts: list[str] = []
-    skills_used: list[str] = []
-    tools_used: dict[str, int] = {}
 
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+def _custom_model_litellm_kwargs(model: str) -> dict[str, str]:
+    if not (isinstance(model, str) and model.startswith("custom/")):
+        return {}
 
-        etype = event.get("type")
-
-        if etype == "tool_use":
-            tool_name = event.get("tool_name", "")
-            tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
-
-            if tool_name == "activate_skill":
-                params = event.get("parameters") or {}
-                skill = (
-                    params.get("skill_name")
-                    or params.get("name")
-                    or next((v for v in params.values() if isinstance(v, str)), "")
-                )
-                if skill and skill not in skills_used:
-                    skills_used.append(skill)
-
-        elif etype == "message" and event.get("role") == "assistant":
-            content = event.get("content", "")
-            if content:
-                response_parts.append(content)
+    api_base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
+    if not api_base or not api_key:
+        return {}
 
     return {
-        "result": "".join(response_parts),
-        "skills_used": skills_used,
-        "tools_used": tools_used,
+        "api_base": api_base,
+        "api_key": api_key,
+        "custom_llm_provider": "openai",
     }
+
+
+def _extract_response_text(response: object) -> str:
+    try:
+        return response.choices[0].message.content or ""
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ""
+
+
+def _extract_response_cost(response: object) -> float | None:
+    hidden = getattr(response, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        value = hidden.get("response_cost")
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    usage = getattr(response, "usage", None)
+    for attr in ("cost", "total_cost"):
+        value = getattr(usage, attr, None)
+        if isinstance(value, (int, float)):
+            return float(value)
+    if isinstance(usage, dict):
+        for key in ("cost", "total_cost"):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
+def _build_tracking_headers(
+    *,
+    paths_id: str,
+    session_id: Optional[str],
+    turn_id: Optional[str],
+    delegation_id: Optional[str],
+) -> dict[str, str]:
+    headers = dict(_EXPERT_HEADERS)
+    headers["X-Kady-Role"] = "expert"
+    headers["X-Kady-Project"] = paths_id
+    if session_id:
+        headers["X-Kady-Session-Id"] = session_id
+    if turn_id:
+        headers["X-Kady-Turn-Id"] = turn_id
+    if delegation_id:
+        headers["X-Kady-Delegation-Id"] = delegation_id
+    return headers
 
 
 def _collect_expert_artifacts(kady_dir: Path, delegation_id: str) -> tuple[str | None, list[str] | None]:
@@ -119,6 +122,23 @@ def _collect_expert_artifacts(kady_dir: Path, delegation_id: str) -> tuple[str |
     return env_lock, deliverables
 
 
+def _summarize_cli_error(stderr: str) -> str:
+    """Return a compact, user-facing error message for expert model failures."""
+    message = stderr.strip()
+    if not message:
+        return "expert model call failed"
+
+    lowered = message.lower()
+    if (
+        "status 500" in lowered
+        or '"code":500' in lowered
+        or "internal server error" in lowered
+    ):
+        return "Expert model failed with upstream 500 Internal Server Error."
+
+    return message
+
+
 async def delegate_task(
     prompt: str,
     working_directory: Optional[str] = None,
@@ -136,12 +156,6 @@ async def delegate_task(
         activated Gemini CLI skill names), and ``tools_used`` (tool call
         counts).
     """
-    env = os.environ.copy()
-    for var in _VERTEX_AI_ENV_VARS:
-        env.pop(var, None)
-
-    prev_headers = env.get("GEMINI_CLI_CUSTOM_HEADERS", "").strip()
-
     paths = active_paths()
 
     # Hard spend cap: if the project has a spendLimitUsd set and the cumulative
@@ -169,11 +183,6 @@ async def delegate_task(
                 "limitUsd": limit,
             }
 
-    # Some models (e.g. GPT-5.4 Nano) pass `working_directory="."` or other
-    # relative paths when they shouldn't. Treat any relative path as being
-    # relative to the project's sandbox, not the repo root — the sandbox IS
-    # the working directory. Absolute paths that fall inside the sandbox are
-    # honored as-is; otherwise we refuse and fall back to the sandbox.
     if working_directory is None or not working_directory.strip():
         cwd = paths.sandbox
     else:
@@ -187,114 +196,82 @@ async def delegate_task(
 
     cwd.mkdir(parents=True, exist_ok=True)
 
-    # Reproducibility: stamp turn + delegation identifiers into the env so the
-    # expert can name its env.lock / deliverables.json files correctly, and
-    # seed every RNG it controls from KADY_SEED.
     state = tool_context.state if tool_context is not None else None
     turn_id: Optional[str] = None
     session_id: Optional[str] = None
     delegation_id: Optional[str] = None
-    selected_model: Optional[str] = None
+    selected_model = _DEFAULT_EXPERT_MODEL
     if state is not None:
         turn_id = state.get("_turnId")
         session_id = state.get("_sessionId")
-        # Prefer the explicit expert model; fall back to the orchestrator
-        # model for backwards compat with older clients that only send
-        # `_model` and for programmatic callers.
-        raw_model = state.get("_expertModel") or state.get("_model")
+        raw_model = state.get("_expertModel") or _DEFAULT_EXPERT_MODEL
         if isinstance(raw_model, str) and raw_model.strip():
             selected_model = raw_model.strip()
     if session_id and turn_id:
-        env["KADY_SEED"] = session_seed(session_id)
-        env["KADY_TURN_ID"] = turn_id
-        env["KADY_SESSION_ID"] = session_id
-        # Delegation id is monotonic within a turn to keep paths predictable.
         counter_key = f"_delegation_counter_{turn_id}"
         prev = state.get(counter_key) or 0
         delegation_id = f"{int(prev) + 1:03d}"
         state[counter_key] = int(prev) + 1
-        env["KADY_DELEGATION_ID"] = delegation_id
 
-    # Propagate the active project to expert-side MCP servers (e.g. the
-    # pdf-annotations server needs to resolve the right sandbox), and
-    # stamp an author label the PDF viewer renders next to any
-    # annotations the expert emits.
-    env["KADY_PROJECT_ID"] = paths.id
-    if delegation_id:
-        env.setdefault("KADY_EXPERT_ID", delegation_id)
-        env.setdefault("KADY_EXPERT_LABEL", f"Expert #{delegation_id}")
+    headers = _build_tracking_headers(
+        paths_id=paths.id,
+        session_id=session_id,
+        turn_id=turn_id,
+        delegation_id=delegation_id,
+    )
 
-    # Build the final GEMINI_CLI_CUSTOM_HEADERS value now that we know the
-    # Kady correlation ids. The LiteLLM proxy's cost callback reads these
-    # off the inbound HTTP request and writes one ledger entry per expert
-    # completion, tagged back to the right session/turn/delegation.
-    kady_header_parts = [
-        f"X-Kady-Role: expert",
-        f"X-Kady-Project: {paths.id}",
-    ]
-    if session_id:
-        kady_header_parts.append(f"X-Kady-Session-Id: {session_id}")
-    if turn_id:
-        kady_header_parts.append(f"X-Kady-Turn-Id: {turn_id}")
-    if delegation_id:
-        kady_header_parts.append(f"X-Kady-Delegation-Id: {delegation_id}")
-    header_segments: list[str] = []
-    if prev_headers:
-        header_segments.append(prev_headers)
-    header_segments.append(_CLI_OPENROUTER_HEADERS)
-    header_segments.extend(kady_header_parts)
-    env["GEMINI_CLI_CUSTOM_HEADERS"] = ", ".join(header_segments)
+    request_model = _strip_custom_model_prefix(selected_model)
 
-    sandbox_venv = cwd / ".venv"
-    if sandbox_venv.is_dir():
-        venv_bin = str(sandbox_venv / "bin")
-        env["VIRTUAL_ENV"] = str(sandbox_venv)
-        path_parts = env.get("PATH", "").split(os.pathsep)
-        old_venv = os.environ.get("VIRTUAL_ENV")
-        if old_venv:
-            old_bin = os.path.join(old_venv, "bin")
-            path_parts = [p for p in path_parts if p != old_bin]
-        env["PATH"] = os.pathsep.join([venv_bin] + path_parts)
-
-    # Forward the orchestrator-selected model to the expert so local Ollama
-    # (or direct LiteLLM-registered Gemini) is used end-to-end. The CLI
-    # only routes via the LiteLLM proxy, so anything that isn't a model
-    # the proxy knows about (gemini-*, ollama/*) would hang or 404 — in
-    # that case fall back to the CLI default (a gemini-* model).
-    cli_args: list[str] = ["gemini", "-p", prompt, "--yolo",
-                           "--output-format", "stream-json"]
-    if selected_model and _cli_can_route(selected_model):
-        cli_args.extend(["-m", selected_model])
+    completion_kwargs = {
+        "model": request_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "extra_headers": headers,
+        "timeout": 600,
+        "metadata": {
+            "kady_role": "expert",
+            "kady_project": paths.id,
+            **({"kady_session_id": session_id} if session_id else {}),
+            **({"kady_turn_id": turn_id} if turn_id else {}),
+            **({"kady_delegation_id": delegation_id} if delegation_id else {}),
+        },
+        "cwd": str(cwd),
+        **_custom_model_litellm_kwargs(selected_model),
+    }
 
     started_at = time.time()
-    proc = await asyncio.create_subprocess_exec(
-        *cli_args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        env=env,
-    )
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    try:
+        response = await litellm.acompletion(**completion_kwargs)
+    except Exception as exc:
+        raise RuntimeError(_summarize_cli_error(str(exc))) from exc
     duration_ms = int((time.time() - started_at) * 1000)
 
-    if proc.returncode != 0:
-        raise RuntimeError(
-            stderr_bytes.decode(errors="replace").strip() or "gemini command failed"
-        )
+    result = {
+        "result": _extract_response_text(response),
+        "skills_used": [],
+        "tools_used": {},
+    }
 
-    raw = stdout_bytes.decode(errors="replace")
-    result = _parse_stream_json(raw)
-
-    # Persist delegation into the manifest (best-effort).
     if session_id and turn_id and delegation_id:
+        try:
+            record_cost(
+                session_id=session_id,
+                turn_id=turn_id,
+                role="expert",
+                model=selected_model,
+                usage_dict=getattr(response, "usage", None),
+                cost_usd=_extract_response_cost(response),
+                delegation_id=delegation_id,
+                project_id=paths.id,
+            )
+        except Exception:
+            pass
+
         env_lock: str | None = None
         deliverables: list[str] | None = None
         kady_dir = cwd / ".kady"
         if kady_dir.is_dir():
             env_lock, deliverables = _collect_expert_artifacts(kady_dir, delegation_id)
         try:
-            # Also mirror the delegation dir into the run-level manifest tree so
-            # the expert's stdout is reachable by turnId (not just by cwd).
             target_expert_dir = paths.runs_dir / session_id / turn_id / "expert" / delegation_id
             target_expert_dir.mkdir(parents=True, exist_ok=True)
             await attach_delegation(
@@ -305,7 +282,7 @@ async def delegate_task(
                 cwd=str(cwd.relative_to(REPO_ROOT)) if cwd.is_relative_to(REPO_ROOT) else str(cwd),
                 result=result,
                 duration_ms=duration_ms,
-                stdout=raw,
+                stdout=result["result"],
                 env_lock=env_lock,
                 deliverables=deliverables,
             )

@@ -25,7 +25,7 @@ load_dotenv()
 
 DEFAULT_MODEL = (
     os.getenv("DEFAULT_AGENT_MODEL")
-    or "openrouter/anthropic/claude-opus-4.7"
+    or "custom/gpt-5.4-proxy"
 )
 # Separate default for the Gemini CLI expert subprocess. The expert is a
 # tool-heavy CLI agent, so we recommend Gemini 3.1 Pro (native tool calling +
@@ -33,7 +33,7 @@ DEFAULT_MODEL = (
 # can still override via DEFAULT_EXPERT_MODEL or per-turn from the UI.
 DEFAULT_EXPERT_MODEL = (
     os.getenv("DEFAULT_EXPERT_MODEL")
-    or "openrouter/google/gemini-3.1-pro-preview"
+    or "custom/gemini-3-pro-proxy"
 )
 EXTRA_HEADERS = {"X-Title": "Kady", "HTTP-Referer": "https://www.k-dense.ai"}
 PARALLEL_API_KEY = os.getenv("PARALLEL_API_KEY")
@@ -105,6 +105,37 @@ def _build_instruction() -> str:
     return base + format_skills_reference(skills)
 
 
+def _strip_custom_model_prefix(model: str) -> str:
+    if isinstance(model, str) and model.startswith("custom/"):
+        return model[len("custom/") :]
+    return model
+
+
+def _custom_model_litellm_kwargs(model: str) -> dict[str, str]:
+    if not (isinstance(model, str) and model.startswith("custom/")):
+        return {}
+
+    api_base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
+    if not api_base or not api_key:
+        return {}
+
+    return {
+        "api_base": api_base,
+        "api_key": api_key,
+        "custom_llm_provider": "openai",
+    }
+
+
+def _sync_model_routing_args(model: str) -> None:
+    custom_kwargs = _custom_model_litellm_kwargs(model)
+    for key in ("api_base", "api_key", "custom_llm_provider"):
+        if key in custom_kwargs:
+            _LITELLM_MODEL._additional_args[key] = custom_kwargs[key]
+        else:
+            _LITELLM_MODEL._additional_args.pop(key, None)
+
+
 def _inject_tracking_headers(callback_context):
     """Stamp the orchestrator's LLM call with Kady correlation headers.
 
@@ -160,8 +191,10 @@ def _inject_tracking_headers(callback_context):
 
 def _override_model(callback_context, llm_request):
     override = callback_context.state.get("_model")
+    effective_model = override or llm_request.model
     if override:
-        llm_request.model = override
+        llm_request.model = _strip_custom_model_prefix(override)
+    _sync_model_routing_args(effective_model)
     _inject_tracking_headers(callback_context)
     return None
 
@@ -189,7 +222,6 @@ async def _open_turn_manifest(callback_context):
         model = state.get("_model") or DEFAULT_MODEL
         expert_model = (
             state.get("_expertModel")
-            or state.get("_model")
             or DEFAULT_EXPERT_MODEL
         )
         skills = state.get("_skills") or []
