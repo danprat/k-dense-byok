@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional
 
 import litellm
-from dotenv import load_dotenv
 from google.adk.tools.tool_context import ToolContext
 
 from ..cost_ledger import check_project_budget, record_cost
@@ -18,13 +17,17 @@ from ..projects import active_paths, get_project
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-load_dotenv(REPO_ROOT / "kady_agent" / ".env")
-
-_DEFAULT_EXPERT_MODEL = os.getenv("DEFAULT_EXPERT_MODEL", "custom/gpt-5.4-proxy").strip()
 _EXPERT_HEADERS = {
     "X-Title": "Kady-Expert",
     "HTTP-Referer": "https://www.k-dense.ai",
 }
+
+
+def _default_expert_model() -> str:
+    value = os.getenv("DEFAULT_EXPERT_MODEL", "gpt-5.4-proxy")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "gpt-5.4-proxy"
 
 
 def _strip_custom_model_prefix(model: str) -> str:
@@ -33,20 +36,33 @@ def _strip_custom_model_prefix(model: str) -> str:
     return model
 
 
-def _custom_model_litellm_kwargs(model: str) -> dict[str, str]:
-    if not (isinstance(model, str) and model.startswith("custom/")):
+def _custom_model_litellm_kwargs(model: str, request_model: str) -> dict[str, str]:
+    if not isinstance(model, str) or not isinstance(request_model, str):
         return {}
 
-    api_base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
-    api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
-    if not api_base or not api_key:
+    # Keep backward compatibility with `custom/...` while supporting
+    # OpenAI-compatible proxy ids without a provider prefix.
+    is_proxy_model = model.startswith("custom/") or request_model.endswith("-proxy")
+    if not is_proxy_model:
         return {}
 
-    return {
+    api_base = (
+        os.environ.get("OPENAI_COMPAT_API_BASE", "").strip().rstrip("/")
+        or os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
+        or "https://litellm.bisakerja.id"
+    )
+    api_key = (
+        os.environ.get("OPENAI_COMPAT_API_KEY", "").strip()
+        or os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
+    )
+
+    kwargs: dict[str, str] = {
         "api_base": api_base,
-        "api_key": api_key,
         "custom_llm_provider": "openai",
     }
+    if api_key:
+        kwargs["api_key"] = api_key
+    return kwargs
 
 
 def _extract_response_text(response: object) -> str:
@@ -200,11 +216,11 @@ async def delegate_task(
     turn_id: Optional[str] = None
     session_id: Optional[str] = None
     delegation_id: Optional[str] = None
-    selected_model = _DEFAULT_EXPERT_MODEL
+    selected_model = _default_expert_model()
     if state is not None:
         turn_id = state.get("_turnId")
         session_id = state.get("_sessionId")
-        raw_model = state.get("_expertModel") or _DEFAULT_EXPERT_MODEL
+        raw_model = state.get("_expertModel") or _default_expert_model()
         if isinstance(raw_model, str) and raw_model.strip():
             selected_model = raw_model.strip()
     if session_id and turn_id:
@@ -235,7 +251,7 @@ async def delegate_task(
             **({"kady_delegation_id": delegation_id} if delegation_id else {}),
         },
         "cwd": str(cwd),
-        **_custom_model_litellm_kwargs(selected_model),
+        **_custom_model_litellm_kwargs(selected_model, request_model),
     }
 
     started_at = time.time()

@@ -285,7 +285,7 @@ async def test_delegate_task_passes_custom_openai_proxy_without_provider_prefix(
 async def test_delegate_task_does_not_fallback_to_orchestrator_model_for_expert(active_project, monkeypatch):
     called = {}
     state = {
-        "_model": "gpt-5.4-proxy",
+        "_model": "gemini-3-pro-proxy",
     }
     ctx = types.SimpleNamespace(state=state)
 
@@ -300,4 +300,4 @@ async def test_delegate_task_does_not_fallback_to_orchestrator_model_for_expert(
 
     await gemini_cli.delegate_task("analyze", tool_context=ctx)
     assert called["kwargs"]["model"] == "gpt-5.4-proxy"
-    assert called["kwargs"]["model"] != "gpt-5.4-proxy"
+    assert called["kwargs"]["model"] != state["_model"]

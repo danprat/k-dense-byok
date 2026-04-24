@@ -67,9 +67,53 @@ async def test_ollama_unavailable_returns_empty_list(asgi_client, monkeypatch):
 async def test_custom_models_unconfigured_returns_empty_list(asgi_client, monkeypatch):
     monkeypatch.delenv("CUSTOM_OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("CUSTOM_OPENAI_MODELS", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_MODELS", raising=False)
     resp = await asgi_client.get("/custom/models")
     assert resp.status_code == 200
     assert resp.json() == {"available": False, "configured": False, "models": []}
+
+
+async def test_custom_models_falls_back_to_openai_compat_vars(asgi_client, monkeypatch):
+    monkeypatch.delenv("CUSTOM_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("CUSTOM_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_OPENAI_MODELS", raising=False)
+    monkeypatch.setenv("OPENAI_COMPAT_API_BASE", "https://litellm.bisakerja.id")
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "sk-test")
+    monkeypatch.setenv(
+        "OPENAI_COMPAT_MODELS",
+        json.dumps([
+            {"id": "gpt-5.4-proxy", "label": "GPT-5.4 Proxy"},
+            {"id": "gemini-3-pro-proxy", "label": "Gemini 3 Pro Proxy"},
+        ]),
+    )
+
+    resp = await asgi_client.get("/custom/models")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["configured"] is True
+    assert [m["id"] for m in body["models"]] == [
+        "custom/gpt-5.4-proxy",
+        "custom/gemini-3-pro-proxy",
+    ]
+    assert all("sk-test" not in json.dumps(m) for m in body["models"])
+    assert all("litellm.bisakerja.id" not in json.dumps(m) for m in body["models"])
+
+
+async def test_custom_models_prefers_custom_openai_vars_over_compat(asgi_client, monkeypatch):
+    monkeypatch.setenv("CUSTOM_OPENAI_BASE_URL", "https://litellm.example.com")
+    monkeypatch.setenv("CUSTOM_OPENAI_API_KEY", "legacy-key")
+    monkeypatch.setenv("CUSTOM_OPENAI_MODELS", "gpt-5.4-proxy")
+    monkeypatch.setenv("OPENAI_COMPAT_API_BASE", "https://litellm.bisakerja.id")
+    monkeypatch.setenv("OPENAI_COMPAT_API_KEY", "compat-key")
+    monkeypatch.setenv("OPENAI_COMPAT_MODELS", json.dumps([{"id": "gemini-3-pro-proxy"}]))
+
+    resp = await asgi_client.get("/custom/models")
+    body = resp.json()
+    # CUSTOM_OPENAI_* wins — only gpt-5.4-proxy is returned
+    assert [m["id"] for m in body["models"]] == ["custom/gpt-5.4-proxy"]
 
 
 async def test_custom_models_missing_api_key_returns_empty_list(asgi_client, monkeypatch):

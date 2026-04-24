@@ -280,12 +280,46 @@ async def list_ollama_models():
 
 @app.get("/custom/models")
 async def list_custom_models():
-    """Return env-configured custom OpenAI-compatible models in the UI shape."""
+    """Return env-configured custom OpenAI-compatible models in the UI shape.
+
+    Checks ``CUSTOM_OPENAI_*`` first (legacy), then falls back to
+    ``OPENAI_COMPAT_*`` so callers that configure the newer env vars still
+    populate the model dropdown without duplicating their setup.
+    """
     base = os.environ.get("CUSTOM_OPENAI_BASE_URL", "").strip().rstrip("/")
     api_key = os.environ.get("CUSTOM_OPENAI_API_KEY", "").strip()
     raw_models = os.environ.get("CUSTOM_OPENAI_MODELS", "").strip()
+
+    # Fall back to OPENAI_COMPAT_* when the legacy vars are absent.
     if not base or not api_key or not raw_models:
+        compat_base = os.environ.get("OPENAI_COMPAT_API_BASE", "").strip().rstrip("/")
+        compat_key = os.environ.get("OPENAI_COMPAT_API_KEY", "").strip()
+        compat_raw = os.environ.get("OPENAI_COMPAT_MODELS", "").strip()
+        if compat_base and compat_key and compat_raw:
+            # OPENAI_COMPAT_MODELS may be a JSON array of objects or a plain
+            # comma-separated string — normalise either form into names.
+            try:
+                parsed = json.loads(compat_raw)
+                if isinstance(parsed, list):
+                    names = [
+                        str(item.get("id") or item).strip()
+                        for item in parsed
+                        if item
+                    ]
+                else:
+                    names = _parse_custom_models(compat_raw)
+            except (json.JSONDecodeError, AttributeError):
+                names = _parse_custom_models(compat_raw)
+
+            names = [n for n in names if n]
+            if names:
+                return {
+                    "available": True,
+                    "configured": True,
+                    "models": [_custom_model_entry(n, compat_base) for n in names],
+                }
         return {"available": False, "configured": False, "models": []}
+
     models = _parse_custom_models(raw_models)
     if not models:
         return {"available": False, "configured": False, "models": []}
